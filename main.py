@@ -190,7 +190,25 @@ def list_windows():
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             process = psutil.Process(pid)
             exe_name = process.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as error:
+            # protected/elevated processes (antivirus, some games, system
+            # windows) refuse the query - this is expected and not worth
+            # surfacing to the user, but log it so "why isn't my window
+            # showing up in the list" is answerable from the log instead
+            # of a total mystery
+            log.debug(
+                "skipping window %r (pid=%s): %s",
+                title,
+                pid,
+                error,
+            )
+            return
         except Exception:
+            log.exception(
+                "unexpected error inspecting window %r (hwnd=%s)",
+                title,
+                hwnd,
+            )
             return
 
         key = (pid, title)
