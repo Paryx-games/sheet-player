@@ -1,4 +1,5 @@
 import ctypes
+import json
 import logging
 import os
 import sys
@@ -6,7 +7,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import keyboard
 import psutil
@@ -19,6 +20,7 @@ import updater
 
 CURRENT_VERSION = "1.0.0"
 LOG_PATH = "piano_player.log"
+SHEET_LIBRARY_FILE_NAME = "sheets.json"
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -227,6 +229,153 @@ def list_windows():
     results.sort(key=lambda w: w.exe_name.lower())
 
     return results
+
+
+class SheetLibrary:
+    DEFAULT_SHEET_NAME = "Untitled sheet"
+
+    def __init__(self):
+        app_data_directory = os.environ.get(
+            "LOCALAPPDATA",
+            os.path.expanduser("~"),
+        )
+        self.storage_directory = os.path.join(
+            app_data_directory,
+            "VirtualPianoPlayer",
+        )
+        self.storage_path = os.path.join(
+            self.storage_directory,
+            SHEET_LIBRARY_FILE_NAME,
+        )
+        self.sheets = {self.DEFAULT_SHEET_NAME: ""}
+        self.active_sheet_name = self.DEFAULT_SHEET_NAME
+        self.settings = {}
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.storage_path, "r", encoding="utf-8") as handle:
+                content = json.load(handle)
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            log.exception("could not load sheet library")
+            return
+
+        if not isinstance(content, dict):
+            return
+
+        sheets = content.get("sheets")
+
+        if not isinstance(sheets, dict) or not sheets:
+            return
+
+        valid_sheets = {
+            name: sheet_content
+            for name, sheet_content in sheets.items()
+            if isinstance(name, str) and isinstance(sheet_content, str)
+        }
+
+        if not valid_sheets:
+            return
+
+        self.sheets = valid_sheets
+        active_sheet_name = content.get("active_sheet_name")
+
+        if active_sheet_name in self.sheets:
+            self.active_sheet_name = active_sheet_name
+        else:
+            self.active_sheet_name = next(iter(self.sheets))
+
+        settings = content.get("settings", {})
+
+        if isinstance(settings, dict):
+            self.settings = settings
+
+    def save(self):
+        try:
+            os.makedirs(self.storage_directory, exist_ok=True)
+            temporary_path = f"{self.storage_path}.tmp"
+
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "active_sheet_name": self.active_sheet_name,
+                        "settings": self.settings,
+                        "sheets": self.sheets,
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            os.replace(temporary_path, self.storage_path)
+            return True
+        except OSError:
+            log.exception("could not save sheet library")
+            return False
+
+    def get_sheet_names(self):
+        return list(self.sheets)
+
+    def get_sheet_content(self, sheet_name):
+        return self.sheets.get(sheet_name, "")
+
+    def get_active_sheet_name(self):
+        return self.active_sheet_name
+
+    def set_active_sheet_name(self, sheet_name):
+        if sheet_name not in self.sheets:
+            return False
+
+        self.active_sheet_name = sheet_name
+        return True
+
+    def set_sheet_content(self, sheet_name, content):
+        if sheet_name not in self.sheets:
+            return False
+
+        self.sheets[sheet_name] = content
+        return True
+
+    def add_sheet(self, sheet_name):
+        normalized_name = sheet_name.strip()
+
+        if not normalized_name or normalized_name in self.sheets:
+            return False
+
+        self.sheets[normalized_name] = ""
+        self.active_sheet_name = normalized_name
+        return True
+
+    def rename_sheet(self, sheet_name, new_name):
+        normalized_name = new_name.strip()
+
+        if (
+            sheet_name not in self.sheets
+            or not normalized_name
+            or normalized_name in self.sheets
+        ):
+            return False
+
+        sheet_content = self.sheets.pop(sheet_name)
+        self.sheets[normalized_name] = sheet_content
+        self.active_sheet_name = normalized_name
+        return True
+
+    def delete_sheet(self, sheet_name):
+        if sheet_name not in self.sheets or len(self.sheets) == 1:
+            return False
+
+        del self.sheets[sheet_name]
+        self.active_sheet_name = next(iter(self.sheets))
+        return True
+
+    def get_setting(self, name, default):
+        return self.settings.get(name, default)
+
+    def set_settings(self, settings):
+        self.settings = settings
 
 
 class SheetParser:
@@ -966,6 +1115,13 @@ class App:
 
         self.editing = True
         self.closing = False
+        self.sheet_library = SheetLibrary()
+        self.editor_save_timer = None
+        self.is_loading_sheet = False
+        self.sidebar_visible = self.sheet_library.get_setting(
+            "sidebar_visible",
+            True,
+        )
 
         # true while the "not running as admin" overlay is covering the
         # window - the overlay blocks mouse clicks on the buttons
@@ -975,14 +1131,24 @@ class App:
         self.overlay_active = False
 
         self.tempo = tk.IntVar(
-            value=DEFAULT_TEMPO
+            value=self.sheet_library.get_setting("tempo", DEFAULT_TEMPO)
         )
 
-        self.loop_enabled = tk.BooleanVar(value=False)
-        self.loop_scope = tk.StringVar(value="whole sheet")
-        self.loop_start = tk.StringVar(value="1")
-        self.loop_end = tk.StringVar(value="1")
-        self.loop_repeats = tk.StringVar(value="1")
+        self.loop_enabled = tk.BooleanVar(
+            value=self.sheet_library.get_setting("loop_enabled", False)
+        )
+        self.loop_scope = tk.StringVar(
+            value=self.sheet_library.get_setting("loop_scope", "whole sheet")
+        )
+        self.loop_start = tk.StringVar(
+            value=str(self.sheet_library.get_setting("loop_start", 1))
+        )
+        self.loop_end = tk.StringVar(
+            value=str(self.sheet_library.get_setting("loop_end", 1))
+        )
+        self.loop_repeats = tk.StringVar(
+            value=str(self.sheet_library.get_setting("loop_repeats", 1))
+        )
 
         self.status = tk.StringVar(
             value="paste a sheet"
@@ -993,7 +1159,7 @@ class App:
         )
 
         self.target_mode = tk.StringVar(
-            value="foreground"
+            value=self.sheet_library.get_setting("target_mode", "foreground")
         )
 
         self.selected_window_label = tk.StringVar(
@@ -1076,10 +1242,56 @@ class App:
             pady=(7, 0),
         )
 
+        self.sidebar_toggle_button = self.make_button(
+            header,
+            "hide sheets",
+            self.toggle_sidebar,
+        )
+
+        self.sidebar_toggle_button.pack(side="right")
+
         self.build_target_bar()
 
-        self.editor = tk.Text(
+        self.workspace = tk.Frame(
             self.root,
+            bg="#101216",
+        )
+
+        self.workspace.pack(
+            fill="both",
+            expand=True,
+            padx=22,
+            pady=8,
+        )
+
+        self.sidebar = tk.Frame(
+            self.workspace,
+            width=210,
+            bg="#15181d",
+            highlightthickness=1,
+            highlightbackground="#292e35",
+        )
+
+        self.sidebar.pack_propagate(False)
+        self.build_sheet_sidebar()
+
+        self.content_area = tk.Frame(
+            self.workspace,
+            bg="#101216",
+        )
+
+        self.content_area.pack(
+            side="right",
+            fill="both",
+            expand=True,
+            padx=(10, 0),
+        )
+
+        if self.sidebar_visible:
+            self.sidebar.pack(side="left", fill="y")
+
+        self.editor = tk.Text(
+            self.content_area,
             wrap=tk.NONE,
             font=(
                 "cascadia mono",
@@ -1098,12 +1310,12 @@ class App:
         self.editor.pack(
             fill="both",
             expand=True,
-            padx=22,
-            pady=8,
         )
 
+        self.editor.bind("<<Modified>>", self.on_editor_changed)
+
         self.sheet_area = tk.Frame(
-            self.root,
+            self.content_area,
             bg="#0d0f13",
             highlightthickness=1,
             highlightbackground="#292e35",
@@ -1440,6 +1652,271 @@ class App:
         )
         self.pause_button.configure(state="disabled")
 
+        self.load_active_sheet()
+        self.register_preference_traces()
+
+    def build_sheet_sidebar(self):
+        tk.Label(
+            self.sidebar,
+            text="Sheets",
+            font=("segoe ui", 11, "bold"),
+            fg="#f2f4f7",
+            bg="#15181d",
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+
+        tk.Label(
+            self.sidebar,
+            text="Saved locally on this device",
+            font=("segoe ui", 8),
+            fg="#747d87",
+            bg="#15181d",
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        list_frame = tk.Frame(self.sidebar, bg="#15181d")
+        list_frame.pack(fill="both", expand=True, padx=8)
+
+        self.sheet_list = tk.Listbox(
+            list_frame,
+            bg="#0d0f13",
+            fg="#dce1e6",
+            selectbackground="#247f4c",
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#292e35",
+            font=("segoe ui", 9),
+            exportselection=False,
+        )
+
+        self.sheet_list.pack(side="left", fill="both", expand=True)
+        self.sheet_list.bind("<<ListboxSelect>>", self.on_sheet_selected)
+
+        sheet_scrollbar = tk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self.sheet_list.yview,
+        )
+
+        sheet_scrollbar.pack(side="right", fill="y")
+
+        self.sheet_list.configure(yscrollcommand=sheet_scrollbar.set)
+
+        actions = tk.Frame(self.sidebar, bg="#15181d")
+        actions.pack(fill="x", padx=8, pady=8)
+
+        self.make_button(actions, "New sheet", self.create_sheet).pack(
+            fill="x",
+            pady=(0, 5),
+        )
+        self.make_button(actions, "Rename", self.rename_sheet).pack(
+            fill="x",
+            pady=(0, 5),
+        )
+        self.make_button(actions, "Delete", self.delete_sheet).pack(fill="x")
+
+        self.refresh_sheet_list()
+
+    def register_preference_traces(self):
+        for variable in (
+            self.tempo,
+            self.target_mode,
+            self.loop_enabled,
+            self.loop_scope,
+            self.loop_start,
+            self.loop_end,
+            self.loop_repeats,
+        ):
+            variable.trace_add("write", self.on_preference_changed)
+
+    def get_preferences(self):
+        return {
+            "loop_enabled": self.loop_enabled.get(),
+            "loop_end": self.loop_end.get(),
+            "loop_repeats": self.loop_repeats.get(),
+            "loop_scope": self.loop_scope.get(),
+            "loop_start": self.loop_start.get(),
+            "sidebar_visible": self.sidebar_visible,
+            "target_mode": self.target_mode.get(),
+            "tempo": self.tempo.get(),
+        }
+
+    def save_library(self):
+        self.sheet_library.set_settings(self.get_preferences())
+        self.sheet_library.save()
+
+    def on_preference_changed(self, *_arguments):
+        self.save_library()
+
+    def on_editor_changed(self, _event):
+        if not self.editor.edit_modified():
+            return
+
+        self.editor.edit_modified(False)
+
+        if self.is_loading_sheet:
+            return
+
+        if self.editor_save_timer is not None:
+            self.root.after_cancel(self.editor_save_timer)
+
+        self.editor_save_timer = self.root.after(500, self.save_current_sheet)
+
+    def save_current_sheet(self):
+        self.editor_save_timer = None
+        sheet_content = self.editor.get("1.0", "end-1c")
+        self.sheet_library.set_sheet_content(
+            self.sheet_library.get_active_sheet_name(),
+            sheet_content,
+        )
+        self.save_library()
+
+    def load_active_sheet(self):
+        sheet_name = self.sheet_library.get_active_sheet_name()
+        self.is_loading_sheet = True
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", self.sheet_library.get_sheet_content(sheet_name))
+        self.editor.edit_modified(False)
+        self.is_loading_sheet = False
+        self.refresh_sheet_list()
+
+    def refresh_sheet_list(self):
+        if not hasattr(self, "sheet_list"):
+            return
+
+        active_sheet_name = self.sheet_library.get_active_sheet_name()
+        self.sheet_list.delete(0, "end")
+
+        for index, sheet_name in enumerate(self.sheet_library.get_sheet_names()):
+            self.sheet_list.insert("end", sheet_name)
+
+            if sheet_name == active_sheet_name:
+                self.sheet_list.selection_set(index)
+                self.sheet_list.activate(index)
+
+    def on_sheet_selected(self, _event):
+        if not hasattr(self, "player") or self.player.playing:
+            return
+
+        selection = self.sheet_list.curselection()
+
+        if not selection:
+            return
+
+        sheet_name = self.sheet_list.get(selection[0])
+
+        if sheet_name == self.sheet_library.get_active_sheet_name():
+            return
+
+        self.save_current_sheet()
+        self.sheet_library.set_active_sheet_name(sheet_name)
+        self.show_active_sheet_in_editor()
+        self.save_library()
+
+    def show_active_sheet_in_editor(self):
+        if not self.editing:
+            self.sheet_area.pack_forget()
+            self.editor.pack(fill="both", expand=True)
+            self.editing = True
+            self.submit_button.configure(state="normal")
+            self.edit_button.configure(state="disabled")
+
+        self.events = []
+        self.selected_event = 0
+        self.load_active_sheet()
+        self.status.set("editing saved sheet")
+
+    def create_sheet(self):
+        if self.player.playing:
+            return
+
+        sheet_name = simpledialog.askstring(
+            "New sheet",
+            "Sheet name:",
+            parent=self.root,
+        )
+
+        if sheet_name is None:
+            return
+
+        self.save_current_sheet()
+
+        if not self.sheet_library.add_sheet(sheet_name):
+            messagebox.showerror(
+                "Cannot create sheet",
+                "Use a unique, non-empty sheet name.",
+                parent=self.root,
+            )
+            return
+
+        self.show_active_sheet_in_editor()
+        self.save_library()
+
+    def rename_sheet(self):
+        if self.player.playing:
+            return
+
+        current_name = self.sheet_library.get_active_sheet_name()
+        sheet_name = simpledialog.askstring(
+            "Rename sheet",
+            "Sheet name:",
+            initialvalue=current_name,
+            parent=self.root,
+        )
+
+        if sheet_name is None:
+            return
+
+        if not self.sheet_library.rename_sheet(current_name, sheet_name):
+            messagebox.showerror(
+                "Cannot rename sheet",
+                "Use a unique, non-empty sheet name.",
+                parent=self.root,
+            )
+            return
+
+        self.refresh_sheet_list()
+        self.save_library()
+
+    def delete_sheet(self):
+        if self.player.playing:
+            return
+
+        current_name = self.sheet_library.get_active_sheet_name()
+
+        if len(self.sheet_library.get_sheet_names()) == 1:
+            messagebox.showinfo(
+                "Keep one sheet",
+                "Create another sheet before deleting this one.",
+                parent=self.root,
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Delete sheet",
+            f"Delete '{current_name}'? This cannot be undone.",
+            parent=self.root,
+        ):
+            return
+
+        if self.sheet_library.delete_sheet(current_name):
+            self.show_active_sheet_in_editor()
+            self.save_library()
+
+    def toggle_sidebar(self):
+        self.sidebar_visible = not self.sidebar_visible
+
+        if self.sidebar_visible:
+            self.sidebar.pack(side="left", fill="y", before=self.content_area)
+            self.content_area.pack_configure(padx=(10, 0))
+            self.sidebar_toggle_button.configure(text="hide sheets")
+        else:
+            self.sidebar.pack_forget()
+            self.content_area.pack_configure(padx=0)
+            self.sidebar_toggle_button.configure(text="show sheets")
+
+        self.save_library()
+
     def build_target_bar(self):
         bar = tk.Frame(
             self.root,
@@ -1492,7 +1969,9 @@ class App:
             ],
         )
 
-        self.mode_box.current(0)
+        self.mode_box.current(
+            1 if self.target_mode.get() == "specific" else 0
+        )
 
         self.mode_box.pack(
             side="left",
@@ -1532,6 +2011,9 @@ class App:
             fg="#77808a",
             bg="#15181d",
         )
+
+        if self.target_mode.get() == "specific":
+            self.on_mode_change()
 
     def check_for_update_background(self):
         info = updater.check_for_update(CURRENT_VERSION)
@@ -2060,9 +2542,6 @@ class App:
         self.sheet_area.pack(
             fill="both",
             expand=True,
-            padx=22,
-            pady=8,
-            before=self.start_button.master,
         )
 
         self.submit_button.configure(
@@ -2090,9 +2569,6 @@ class App:
         self.editor.pack(
             fill="both",
             expand=True,
-            padx=22,
-            pady=8,
-            before=self.start_button.master,
         )
 
         self.submit_button.configure(
@@ -2496,6 +2972,7 @@ class App:
 
         self.closing = True
 
+        self.save_current_sheet()
         self.player.stop()
 
         try:
