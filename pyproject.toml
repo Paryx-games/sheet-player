@@ -1,0 +1,13 @@
+[project]
+name = "piano-keys"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "keyboard>=0.13.5",
+    "psutil>=7.2.2",
+    "pydirectinput>=1.0.4",
+    "pyinstaller>=6.22.2",
+    "pywin32>=312",
+]
