@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import keyboard
 import psutil
@@ -21,6 +21,8 @@ import updater
 CURRENT_VERSION = "1.0.0"
 LOG_PATH = "piano_player.log"
 SHEET_LIBRARY_FILE_NAME = "sheets.json"
+SHEET_FILE_EXTENSION = ".piano-sheet.json"
+MAX_SHEET_FILE_BYTES = 1_000_000
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -376,6 +378,59 @@ class SheetLibrary:
 
     def set_settings(self, settings):
         self.settings = settings
+
+
+class SheetFileCodec:
+    FORMAT_NAME = "virtual-piano-sheet"
+    FORMAT_VERSION = 1
+
+    @classmethod
+    def create_export(cls, sheet_name, sheet_content):
+        return {
+            "format": cls.FORMAT_NAME,
+            "name": sheet_name,
+            "sheet": sheet_content,
+            "version": cls.FORMAT_VERSION,
+        }
+
+    @classmethod
+    def load(cls, file_path):
+        try:
+            if os.path.getsize(file_path) > MAX_SHEET_FILE_BYTES:
+                return None, "sheet files must be smaller than 1 MB"
+
+            with open(file_path, "r", encoding="utf-8-sig") as handle:
+                content = handle.read()
+        except OSError as error:
+            return None, f"could not read the file: {error}"
+
+        if file_path.lower().endswith(".txt"):
+            return {
+                "name": os.path.splitext(os.path.basename(file_path))[0],
+                "sheet": content,
+            }, None
+
+        try:
+            document = json.loads(content)
+        except json.JSONDecodeError as error:
+            return None, f"invalid sheet file: {error.msg}"
+
+        if not isinstance(document, dict):
+            return None, "invalid sheet file: expected an object"
+
+        if document.get("format") != cls.FORMAT_NAME:
+            return None, "this file is not a virtual piano sheet"
+
+        if document.get("version") != cls.FORMAT_VERSION:
+            return None, "this sheet file uses an unsupported version"
+
+        sheet_name = document.get("name")
+        sheet_content = document.get("sheet")
+
+        if not isinstance(sheet_name, str) or not isinstance(sheet_content, str):
+            return None, "invalid sheet file: missing sheet name or content"
+
+        return {"name": sheet_name, "sheet": sheet_content}, None
 
 
 class SheetParser:
@@ -1715,6 +1770,31 @@ class App:
         )
         self.make_button(actions, "Delete", self.delete_sheet).pack(fill="x")
 
+        tk.Frame(self.sidebar, height=1, bg="#292e35").pack(
+            fill="x",
+            padx=8,
+            pady=10,
+        )
+
+        transfer_actions = tk.Frame(self.sidebar, bg="#15181d")
+        transfer_actions.pack(fill="x", padx=8, pady=(0, 8))
+
+        self.make_button(
+            transfer_actions,
+            "Validate",
+            self.validate_active_sheet,
+        ).pack(fill="x", pady=(0, 5))
+        self.make_button(
+            transfer_actions,
+            "Import sheet",
+            self.import_sheet,
+        ).pack(fill="x", pady=(0, 5))
+        self.make_button(
+            transfer_actions,
+            "Export sheet",
+            self.export_sheet,
+        ).pack(fill="x")
+
         self.refresh_sheet_list()
 
     def register_preference_traces(self):
@@ -1902,6 +1982,205 @@ class App:
         if self.sheet_library.delete_sheet(current_name):
             self.show_active_sheet_in_editor()
             self.save_library()
+
+    def validate_sheet_content(self, sheet_content):
+        if not sheet_content.strip():
+            return None, "add at least one note before validating"
+
+        try:
+            return SheetParser.parse(sheet_content), None
+        except ValueError as error:
+            return None, str(error)
+
+    def build_validation_summary(self, events, sheet_content):
+        event_counts = {
+            "chord": 0,
+            "note": 0,
+            "rest": 0,
+            "run": 0,
+        }
+
+        for event in events:
+            event_counts[event["type"]] += 1
+
+        line_count = len(sheet_content.splitlines())
+        return (
+            f"{len(events)} events across {line_count} lines\n\n"
+            f"{event_counts['note']} notes\n"
+            f"{event_counts['chord']} chords\n"
+            f"{event_counts['run']} fast runs\n"
+            f"{event_counts['rest']} rests"
+        )
+
+    def show_validation_preview(
+        self,
+        sheet_content,
+        title,
+        confirm_text=None,
+        on_confirm=None,
+    ):
+        events, error = self.validate_sheet_content(sheet_content)
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.configure(bg="#15181d")
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.grab_set()
+
+        content = tk.Frame(window, bg="#15181d")
+        content.pack(padx=26, pady=22)
+
+        if error is None:
+            heading = "Sheet is ready"
+            message = self.build_validation_summary(events, sheet_content)
+            heading_color = "#59ce87"
+        else:
+            heading = "Sheet needs attention"
+            message = error
+            heading_color = "#e56b6f"
+
+        tk.Label(
+            content,
+            text=heading,
+            font=("segoe ui", 13, "bold"),
+            fg=heading_color,
+            bg="#15181d",
+        ).pack(anchor="w")
+
+        tk.Label(
+            content,
+            text=message,
+            justify="left",
+            anchor="w",
+            font=("segoe ui", 10),
+            fg="#dce1e6",
+            bg="#15181d",
+        ).pack(anchor="w", pady=(8, 18))
+
+        button_row = tk.Frame(content, bg="#15181d")
+        button_row.pack(fill="x")
+
+        if error is None and confirm_text is not None and on_confirm is not None:
+            def confirm():
+                window.destroy()
+                on_confirm(events)
+
+            self.make_button(button_row, confirm_text, confirm).pack(side="left")
+
+        self.make_button(button_row, "Close", window.destroy).pack(side="right")
+        return error is None
+
+    def validate_active_sheet(self):
+        if self.player.playing:
+            return
+
+        self.save_current_sheet()
+        sheet_content = self.editor.get("1.0", "end-1c")
+        self.show_validation_preview(sheet_content, "Validation preview")
+
+    def import_sheet(self):
+        if self.player.playing:
+            return
+
+        file_path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Import sheet",
+            filetypes=(
+                ("Piano sheet", f"*{SHEET_FILE_EXTENSION}"),
+                ("Text sheet", "*.txt"),
+                ("All files", "*.*"),
+            ),
+        )
+
+        if not file_path:
+            return
+
+        imported_sheet, error = SheetFileCodec.load(file_path)
+
+        if error is not None:
+            messagebox.showerror("Cannot import sheet", error, parent=self.root)
+            return
+
+        def import_confirmed(_events):
+            self.finish_import(imported_sheet)
+
+        self.show_validation_preview(
+            imported_sheet["sheet"],
+            "Import preview",
+            "Import sheet",
+            import_confirmed,
+        )
+
+    def finish_import(self, imported_sheet):
+        sheet_name = simpledialog.askstring(
+            "Import sheet",
+            "Sheet name:",
+            initialvalue=imported_sheet["name"],
+            parent=self.root,
+        )
+
+        if sheet_name is None:
+            return
+
+        self.save_current_sheet()
+
+        if not self.sheet_library.add_sheet(sheet_name):
+            messagebox.showerror(
+                "Cannot import sheet",
+                "Use a unique, non-empty sheet name.",
+                parent=self.root,
+            )
+            return
+
+        self.sheet_library.set_sheet_content(
+            self.sheet_library.get_active_sheet_name(),
+            imported_sheet["sheet"],
+        )
+        self.show_active_sheet_in_editor()
+        self.save_library()
+        self.status.set("sheet imported")
+
+    def export_sheet(self):
+        if self.player.playing:
+            return
+
+        self.save_current_sheet()
+        sheet_name = self.sheet_library.get_active_sheet_name()
+        safe_file_name = "".join(
+            character if character.isalnum() or character in " -_" else "_"
+            for character in sheet_name
+        ).strip()
+        file_path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export sheet",
+            defaultextension=SHEET_FILE_EXTENSION,
+            initialfile=f"{safe_file_name or 'sheet'}{SHEET_FILE_EXTENSION}",
+            filetypes=(("Piano sheet", f"*{SHEET_FILE_EXTENSION}"),),
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    SheetFileCodec.create_export(
+                        sheet_name,
+                        self.editor.get("1.0", "end-1c"),
+                    ),
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError as error:
+            messagebox.showerror(
+                "Cannot export sheet",
+                f"could not write the file: {error}",
+                parent=self.root,
+            )
+            return
+
+        self.status.set("sheet exported")
 
     def toggle_sidebar(self):
         self.sidebar_visible = not self.sidebar_visible
@@ -2498,31 +2777,17 @@ class App:
         if self.player.playing:
             return
 
-        sheet = self.editor.get(
-            "1.0",
-            "end-1c",
+        self.save_current_sheet()
+        sheet_content = self.editor.get("1.0", "end-1c")
+        self.show_validation_preview(
+            sheet_content,
+            "Playback preview",
+            "Use sheet",
+            self.finish_submit,
         )
 
-        if not sheet.strip():
-            self.status.set(
-                "paste a sheet first"
-            )
-            return
-
-        try:
-            self.events = SheetParser.parse(
-                sheet
-            )
-
-        except ValueError as error:
-            log.warning("sheet parse failed: %s", error)
-            messagebox.showerror(
-                "invalid sheet",
-                str(error),
-                parent=self.root,
-            )
-            return
-
+    def finish_submit(self, events):
+        self.events = events
         log.info("sheet parsed: %s events", len(self.events))
 
         if not self.events:
