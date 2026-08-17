@@ -18,7 +18,7 @@ import win32process
 
 import updater
 
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.1.0"
 LOG_PATH = "piano_player.log"
 SHEET_LIBRARY_FILE_NAME = "sheets.json"
 SHEET_FILE_EXTENSION = ".piano-sheet.json"
