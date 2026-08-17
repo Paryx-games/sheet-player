@@ -1,0 +1,5 @@
+keyboard
+psutil
+pydirectinput
+pywin32
+pyinstaller
