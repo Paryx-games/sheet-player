@@ -20,7 +20,7 @@ log = logging.getLogger("piano.updater")
 # limiting the way api.github.com does for unauthenticated requests
 VERSION_MANIFEST_URL = (
     "https://raw.githubusercontent.com/"
-    "paryx-games/piano-player/main/version.json"
+    "paryx-games/sheet-player/main/version.json"
 )
 
 REQUEST_TIMEOUT_SECONDS = 6

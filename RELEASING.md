@@ -29,7 +29,7 @@ that URL is the one thing that has to stay in sync by hand.
    ```json
    {
      "version": "1.1.0",
-     "download_url": "https://github.com/paryx-games/piano-player/releases/download/v1.1.0/PianoPlayer.exe",
+     "download_url": "https://github.com/paryx-games/sheet-player/releases/download/v1.1.0/PianoPlayer.exe",
      "changelog": "whatever changed, shown in the update dialog",
      "mandatory": false
    }
