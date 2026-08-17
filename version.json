@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
   "download_url": "https://github.com/paryx-games/piano-player/releases/download/v1.0.0/PianoPlayer.exe",
-  "changelog": "initial release",
+  "changelog": "Initial release",
   "mandatory": false
 }

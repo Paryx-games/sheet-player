@@ -58,5 +58,5 @@ exe = EXE(
     # deliberately NOT setting uac_admin=True here - the app has its
     # own in-app elevation overlay/prompt, forcing OS-level UAC on
     # launch would skip past that and always demand admin up front
-    icon=None,               # put a path to a .ico here if you have one
+    icon="assets/icon.ico",
 )

@@ -17,9 +17,7 @@ import win32process
 
 import updater
 
-
 CURRENT_VERSION = "1.0.0"
-
 LOG_PATH = "piano_player.log"
 
 logging.basicConfig(
