@@ -76,6 +76,7 @@ MAX_TEMPO = 300
 
 START_HOTKEY = "f6"
 STOP_HOTKEY = "f7"
+PAUSE_HOTKEY = "f9"
 EXIT_HOTKEY = "f8"
 
 # how long to wait after focusing a window before trusting it's actually focused
@@ -381,14 +382,17 @@ class Player:
     # sleeping slightly too long and drifting late
     SLEEP_SLACK = 0.0015
 
-    def __init__(self, on_note, on_error):
+    def __init__(self, on_note, on_error, on_finished):
         self.events = []
         self.playing = False
         self.stop_requested = False
+        self.paused = False
         self.thread = None
         self.on_note = on_note
         self.on_error = on_error
+        self.on_finished = on_finished
         self.target = None
+        self.state_changed = threading.Condition()
 
     @staticmethod
     def hold_action(action):
@@ -476,10 +480,42 @@ class Player:
                 pass
 
     def stop(self):
-        self.stop_requested = True
+        with self.state_changed:
+            self.stop_requested = True
+            self.paused = False
+            self.state_changed.notify_all()
         self.release_everything()
 
-    def start(self, events, start_index, tempo, target):
+    def pause(self):
+        with self.state_changed:
+            if not self.playing or self.paused:
+                return False
+
+            self.paused = True
+            self.state_changed.notify_all()
+
+        self.release_everything()
+        return True
+
+    def resume(self):
+        with self.state_changed:
+            if not self.playing or not self.paused:
+                return False
+
+            self.paused = False
+            self.state_changed.notify_all()
+
+        return True
+
+    def start(
+        self,
+        events,
+        start_index,
+        end_index,
+        repeat_count,
+        tempo,
+        target,
+    ):
         if self.playing:
             log.debug("start() ignored - already playing")
             return
@@ -488,10 +524,13 @@ class Player:
         self.target = target
         self.playing = True
         self.stop_requested = False
+        self.paused = False
 
         log.info(
-            "starting playback: index=%s tempo=%s target=%s events=%s",
+            "starting playback: start=%s end=%s repeats=%s tempo=%s target=%s events=%s",
             start_index,
+            end_index,
+            repeat_count,
             tempo,
             target,
             len(self.events),
@@ -499,7 +538,7 @@ class Player:
 
         self.thread = threading.Thread(
             target=self._run,
-            args=(start_index, tempo),
+            args=(start_index, end_index, repeat_count, tempo),
             daemon=True,
         )
 
@@ -542,13 +581,25 @@ class Player:
         occasional slow syscalls (pydirectinput/win32 calls) don't
         compound into the song running progressively later.
         """
-        target_time = clock_start + (target_beats * beat_seconds)
-        remaining = target_time - time.perf_counter() - self.SLEEP_SLACK
+        while True:
+            with self.state_changed:
+                while self.paused and not self.stop_requested:
+                    pause_started = time.perf_counter()
+                    self.state_changed.wait()
+                    clock_start += time.perf_counter() - pause_started
 
-        if remaining > 0:
-            time.sleep(remaining)
+                if self.stop_requested:
+                    return None
 
-    def _run(self, start_index, tempo):
+                target_time = clock_start + (target_beats * beat_seconds)
+                remaining = target_time - time.perf_counter() - self.SLEEP_SLACK
+
+                if remaining <= 0:
+                    return clock_start
+
+                self.state_changed.wait(timeout=remaining)
+
+    def _run(self, start_index, end_index, repeat_count, tempo):
         beat_seconds = 60.0 / tempo
 
         # cumulative beat position at the start of each event, computed
@@ -561,114 +612,142 @@ class Player:
             beat_offsets[index] = cursor
             cursor += self._event_beats(event)
 
-        clock_start = time.perf_counter() - beat_offsets[start_index] * beat_seconds
-
         try:
-            for index in range(
-                start_index,
-                len(self.events),
-            ):
-                if self.stop_requested:
-                    log.debug("stop requested at index %s", index)
-                    break
+            completed_plays = 0
 
-                event = self.events[index]
-                event_beats = self._event_beats(event)
-
-                log.debug(
-                    "event %s/%s type=%s source=%r beats=%.3f",
-                    index,
-                    len(self.events) - 1,
-                    event["type"],
-                    event["source"],
-                    event_beats,
+            while repeat_count == 0 or completed_plays < repeat_count:
+                clock_start = (
+                    time.perf_counter()
+                    - beat_offsets[start_index] * beat_seconds
                 )
 
-                # update the highlight first so you can see exactly
-                # where playback stopped, even if focusing fails below
-                self.on_note(index)
+                for index in range(start_index, end_index + 1):
+                    if self.stop_requested:
+                        log.debug("stop requested at index %s", index)
+                        break
 
-                if not self._ensure_focus():
-                    log.warning("aborting playback - focus check failed at index %s", index)
-                    break
-
-                event_start_beats = beat_offsets[index]
-
-                if event["type"] == "rest":
-                    self._sleep_until(
+                    event_start_beats = beat_offsets[index]
+                    clock_start = self._sleep_until(
                         clock_start,
-                        event_start_beats + event_beats,
+                        event_start_beats,
                         beat_seconds,
                     )
 
-                elif event["type"] == "note":
-                    action = event["actions"][0]
+                    if clock_start is None:
+                        break
 
-                    log.debug("key down: %s", action)
-                    self.hold_action(action)
+                    event = self.events[index]
+                    event_beats = self._event_beats(event)
 
-                    self._sleep_until(
-                        clock_start,
-                        event_start_beats + event_beats * self.HOLD_RATIO,
-                        beat_seconds,
+                    log.debug(
+                        "event %s/%s type=%s source=%r beats=%.3f",
+                        index,
+                        end_index,
+                        event["type"],
+                        event["source"],
+                        event_beats,
                     )
 
-                    log.debug("key up: %s", action)
-                    self.release_action(action)
+                    self.on_note(index)
 
-                    self._sleep_until(
-                        clock_start,
-                        event_start_beats + event_beats,
-                        beat_seconds,
-                    )
+                    if not self._ensure_focus():
+                        log.warning("aborting playback - focus check failed at index %s", index)
+                        self.stop()
+                        break
 
-                elif event["type"] == "chord":
-                    log.debug("chord: %s", event["actions"])
-                    self.press_chord_down(event["actions"])
+                    if event["type"] == "rest":
+                        clock_start = self._sleep_until(
+                            clock_start,
+                            event_start_beats + event_beats,
+                            beat_seconds,
+                        )
 
-                    self._sleep_until(
-                        clock_start,
-                        event_start_beats + event_beats * self.HOLD_RATIO,
-                        beat_seconds,
-                    )
+                    elif event["type"] == "note":
+                        action = event["actions"][0]
 
-                    self.press_chord_up(event["actions"])
-
-                    self._sleep_until(
-                        clock_start,
-                        event_start_beats + event_beats,
-                        beat_seconds,
-                    )
-
-                elif event["type"] == "run":
-                    actions = event["actions"]
-                    per_key_beats = event_beats / max(len(actions), 1)
-
-                    for key_index, action in enumerate(actions):
-                        if self.stop_requested:
-                            break
-
-                        log.debug("run key: %s", action)
+                        log.debug("key down: %s", action)
                         self.hold_action(action)
 
-                        key_start = event_start_beats + key_index * per_key_beats
-
-                        self._sleep_until(
+                        clock_start = self._sleep_until(
                             clock_start,
-                            key_start + per_key_beats * self.HOLD_RATIO,
+                            event_start_beats + event_beats * self.HOLD_RATIO,
                             beat_seconds,
                         )
 
+                        if clock_start is None:
+                            break
+
+                        log.debug("key up: %s", action)
                         self.release_action(action)
 
-                        self._sleep_until(
+                        clock_start = self._sleep_until(
                             clock_start,
-                            key_start + per_key_beats,
+                            event_start_beats + event_beats,
                             beat_seconds,
                         )
 
-            else:
-                log.info("playback reached end of sheet")
+                    elif event["type"] == "chord":
+                        log.debug("chord: %s", event["actions"])
+                        self.press_chord_down(event["actions"])
+
+                        clock_start = self._sleep_until(
+                            clock_start,
+                            event_start_beats + event_beats * self.HOLD_RATIO,
+                            beat_seconds,
+                        )
+
+                        if clock_start is None:
+                            break
+
+                        self.press_chord_up(event["actions"])
+
+                        clock_start = self._sleep_until(
+                            clock_start,
+                            event_start_beats + event_beats,
+                            beat_seconds,
+                        )
+
+                    elif event["type"] == "run":
+                        actions = event["actions"]
+                        per_key_beats = event_beats / max(len(actions), 1)
+
+                        for key_index, action in enumerate(actions):
+                            if self.stop_requested:
+                                break
+
+                            log.debug("run key: %s", action)
+                            self.hold_action(action)
+
+                            key_start = event_start_beats + key_index * per_key_beats
+
+                            clock_start = self._sleep_until(
+                                clock_start,
+                                key_start + per_key_beats * self.HOLD_RATIO,
+                                beat_seconds,
+                            )
+
+                            if clock_start is None:
+                                break
+
+                            self.release_action(action)
+
+                            clock_start = self._sleep_until(
+                                clock_start,
+                                key_start + per_key_beats,
+                                beat_seconds,
+                            )
+
+                    if self.stop_requested or clock_start is None:
+                        break
+
+                if self.stop_requested or clock_start is None:
+                    break
+
+                completed_plays += 1
+                log.info("playback completed pass %s", completed_plays)
+
+            if not self.stop_requested:
+                log.info("playback reached end of selection")
 
         except Exception:
             # this is the fix for "dies silently" - any exception in the
@@ -678,10 +757,13 @@ class Player:
             self.on_error("playback crashed - check piano_player.log")
 
         finally:
+            was_stopped = self.stop_requested
             log.debug("playback loop ending, releasing all keys")
             self.release_everything()
             self.playing = False
             self.stop_requested = False
+            self.paused = False
+            self.on_finished(was_stopped)
 
     @staticmethod
     def _event_beats(event):
@@ -862,13 +944,27 @@ class App:
         self.events = []
         self.note_widgets = []
         self.selected_event = 0
+        self.playback_start_index = 0
 
         self.editing = True
         self.closing = False
 
+        # true while the "not running as admin" overlay is covering the
+        # window - the overlay blocks mouse clicks on the buttons
+        # underneath it, but the F6/F7/F8 hotkeys are global and don't
+        # go through tkinter at all, so without this flag F6 could
+        # still start playback while the overlay is up
+        self.overlay_active = False
+
         self.tempo = tk.IntVar(
             value=DEFAULT_TEMPO
         )
+
+        self.loop_enabled = tk.BooleanVar(value=False)
+        self.loop_scope = tk.StringVar(value="whole sheet")
+        self.loop_start = tk.StringVar(value="1")
+        self.loop_end = tk.StringVar(value="1")
+        self.loop_repeats = tk.StringVar(value="1")
 
         self.status = tk.StringVar(
             value="paste a sheet"
@@ -894,6 +990,7 @@ class App:
         self.player = Player(
             self.note_changed,
             self.player_error,
+            self.playback_finished,
         )
 
         self.root.protocol(
@@ -1081,6 +1178,17 @@ class App:
             padx=6,
         )
 
+        self.pause_button = self.make_button(
+            controls,
+            "pause  [f9]",
+            self.toggle_pause,
+        )
+
+        self.pause_button.pack(
+            side="left",
+            padx=6,
+        )
+
         self.submit_button = self.make_button(
             controls,
             "submit",
@@ -1164,6 +1272,89 @@ class App:
             padx=(8, 0),
         )
 
+        loop_controls = tk.Frame(
+            self.root,
+            bg="#101216",
+        )
+
+        loop_controls.pack(
+            fill="x",
+            padx=22,
+            pady=(0, 6),
+        )
+
+        tk.Checkbutton(
+            loop_controls,
+            text="repeat playback",
+            variable=self.loop_enabled,
+            font=("segoe ui", 9, "bold"),
+            fg="#e8ebef",
+            bg="#101216",
+            activeforeground="#e8ebef",
+            activebackground="#101216",
+            selectcolor="#20252b",
+            highlightthickness=0,
+        ).pack(side="left")
+
+        ttk.Combobox(
+            loop_controls,
+            textvariable=self.loop_scope,
+            values=("whole sheet", "selected range"),
+            state="readonly",
+            width=14,
+        ).pack(side="left", padx=(10, 6))
+
+        tk.Label(
+            loop_controls,
+            text="from",
+            font=("segoe ui", 9),
+            fg="#808995",
+            bg="#101216",
+        ).pack(side="left")
+
+        tk.Spinbox(
+            loop_controls,
+            from_=1,
+            to=99999,
+            textvariable=self.loop_start,
+            width=5,
+            justify="center",
+        ).pack(side="left", padx=(4, 8))
+
+        tk.Label(
+            loop_controls,
+            text="to",
+            font=("segoe ui", 9),
+            fg="#808995",
+            bg="#101216",
+        ).pack(side="left")
+
+        tk.Spinbox(
+            loop_controls,
+            from_=1,
+            to=99999,
+            textvariable=self.loop_end,
+            width=5,
+            justify="center",
+        ).pack(side="left", padx=(4, 12))
+
+        tk.Label(
+            loop_controls,
+            text="plays (0 = infinite)",
+            font=("segoe ui", 9),
+            fg="#808995",
+            bg="#101216",
+        ).pack(side="left")
+
+        tk.Spinbox(
+            loop_controls,
+            from_=0,
+            to=99999,
+            textvariable=self.loop_repeats,
+            width=5,
+            justify="center",
+        ).pack(side="left", padx=(6, 0))
+
         status = tk.Frame(
             self.root,
             bg="#181b20",
@@ -1229,6 +1420,7 @@ class App:
         self.edit_button.configure(
             state="disabled"
         )
+        self.pause_button.configure(state="disabled")
 
     def build_target_bar(self):
         bar = tk.Frame(
@@ -1656,9 +1848,11 @@ class App:
         continue_button.pack(side="left")
 
         self.admin_overlay = overlay
+        self.overlay_active = True
 
     def dismiss_admin_overlay(self, overlay):
         log.info("user chose to continue without admin")
+        self.overlay_active = False
         overlay.destroy()
 
     def request_elevation(self):
@@ -1839,6 +2033,9 @@ class App:
 
         self.editing = False
         self.selected_event = 0
+        self.playback_start_index = 0
+        self.loop_start.set("1")
+        self.loop_end.set(str(len(self.events)))
 
         self.editor.pack_forget()
 
@@ -2051,14 +2248,34 @@ class App:
             index
         )
 
+    def playback_finished(self, was_stopped):
+        self.root.after(
+            0,
+            lambda: self.on_playback_finished(was_stopped),
+        )
+
+    def on_playback_finished(self, was_stopped):
+        self.pause_button.configure(state="disabled", text="pause  [f9]")
+
+        if was_stopped:
+            return
+
+        if not was_stopped:
+            self.status.set("finished")
+
     def start(self):
         log.debug(
-            "App.start() called: editing=%s events=%s player.playing=%s mode=%s",
+            "App.start() called: editing=%s events=%s player.playing=%s mode=%s overlay_active=%s",
             self.editing,
             len(self.events),
             self.player.playing,
             self.target_mode.get(),
+            self.overlay_active,
         )
+
+        if self.overlay_active:
+            log.debug("start() aborted - admin overlay still up")
+            return
 
         if self.editing:
             log.debug("start() aborted - still in editing mode")
@@ -2077,6 +2294,13 @@ class App:
         if self.player.playing:
             log.debug("start() aborted - already playing")
             return
+
+        playback_options = self.get_playback_options()
+
+        if playback_options is None:
+            return
+
+        start_index, end_index, repeat_count = playback_options
 
         if self.target_mode.get() == "specific":
             if self.active_target is None:
@@ -2115,24 +2339,74 @@ class App:
 
         self.player.start(
             self.events,
-            self.selected_event,
+            start_index,
+            end_index,
+            repeat_count,
             self.tempo.get(),
             target,
         )
 
+        self.playback_start_index = start_index
+        self.pause_button.configure(state="normal", text="pause  [f9]")
+
         self.status.set(
-            f"playing from note "
-            f"{self.selected_event + 1}"
+            f"playing notes {start_index + 1}–{end_index + 1}"
         )
 
     def stop(self):
         self.player.stop()
 
         if not self.editing:
+            self.selected_event = self.playback_start_index
+            self.update_note_styles()
             self.status.set(
-                f"stopped at note "
+                f"stopped • reset to note "
                 f"{self.selected_event + 1}"
             )
+
+        self.pause_button.configure(state="disabled", text="pause  [f9]")
+
+    def toggle_pause(self):
+        if self.player.pause():
+            self.pause_button.configure(text="resume  [f9]")
+            self.status.set("paused")
+            return
+
+        if self.player.resume():
+            self.pause_button.configure(text="pause  [f9]")
+            self.status.set("playing")
+
+    def get_playback_options(self):
+        if not self.loop_enabled.get():
+            return self.selected_event, len(self.events) - 1, 1
+
+        try:
+            repeat_count = int(self.loop_repeats.get())
+        except ValueError:
+            self.status.set("enter a whole number of plays")
+            return None
+
+        if repeat_count < 0:
+            self.status.set("plays cannot be negative")
+            return None
+
+        if self.loop_scope.get() == "whole sheet":
+            return 0, len(self.events) - 1, repeat_count
+
+        try:
+            range_start = int(self.loop_start.get()) - 1
+            range_end = int(self.loop_end.get()) - 1
+        except ValueError:
+            self.status.set("enter whole-number range limits")
+            return None
+
+        if not 0 <= range_start <= range_end < len(self.events):
+            self.status.set(
+                f"range must be between 1 and {len(self.events)}"
+            )
+            return None
+
+        return range_start, range_end, repeat_count
 
     def update_scroll_region(
         self,
@@ -2170,11 +2444,22 @@ class App:
             )
 
             keyboard.add_hotkey(
+                PAUSE_HOTKEY,
+                self.toggle_pause,
+            )
+
+            keyboard.add_hotkey(
                 EXIT_HOTKEY,
                 self.exit_program,
             )
 
-            log.info("hotkeys registered: %s/%s/%s", START_HOTKEY, STOP_HOTKEY, EXIT_HOTKEY)
+            log.info(
+                "hotkeys registered: %s/%s/%s/%s",
+                START_HOTKEY,
+                STOP_HOTKEY,
+                PAUSE_HOTKEY,
+                EXIT_HOTKEY,
+            )
 
             while not self.closing:
                 time.sleep(0.1)
