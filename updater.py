@@ -1,5 +1,5 @@
 """
-self-update logic against a version.json manifest hosted on GitHub.
+self-update logic against a version.json manifest hosted on github.
 
 kept separate from main.py on purpose - update mechanics have nothing
 to do with the piano player itself, and this way the updater can be
@@ -16,17 +16,15 @@ import urllib.request
 
 log = logging.getLogger("piano.updater")
 
-# raw.githubusercontent.com serves repo files directly, no API rate
-# limiting the way api.github.com does for unauthenticated requests
-VERSION_MANIFEST_URL = (
+version_manifest_url = (
     "https://raw.githubusercontent.com/"
     "paryx-games/sheet-player/main/version.json"
 )
 
-REQUEST_TIMEOUT_SECONDS = 6
+request_timeout_seconds = 6
 
 
-class UpdateInfo:
+class update_info:
     def __init__(self, version, download_url, changelog, mandatory):
         self.version = version
         self.download_url = download_url
@@ -35,8 +33,7 @@ class UpdateInfo:
 
 
 def parse_version(text):
-    """turns '1.4.2' into (1, 4, 2) so versions compare numerically,
-    not as strings (which would wrongly say '1.10.0' < '1.9.0')"""
+    """turns '1.4.2' into (1, 4, 2) for numerical comparison."""
     parts = []
 
     for piece in text.strip().split("."):
@@ -50,21 +47,18 @@ def parse_version(text):
 
 def check_for_update(current_version):
     """
-    fetches version.json and returns an UpdateInfo if the manifest's
-    version is newer than current_version, else None. never raises -
-    network/parse failures just mean "no update found," logged but
-    not surfaced, so a flaky connection never blocks the app from
-    starting.
+    fetches version.json and returns update_info when a newer version
+    is available. failures are logged and treated as no update.
     """
     try:
         request = urllib.request.Request(
-            VERSION_MANIFEST_URL,
-            headers={"User-Agent": "piano-player-updater"},
+            version_manifest_url,
+            headers={"user-agent": "piano-player-updater"},
         )
 
         with urllib.request.urlopen(
             request,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=request_timeout_seconds,
         ) as response:
             raw = response.read().decode("utf-8")
 
@@ -83,7 +77,7 @@ def check_for_update(current_version):
         )
 
         if parse_version(latest_version) > parse_version(current_version):
-            return UpdateInfo(
+            return update_info(
                 latest_version,
                 download_url,
                 changelog,
@@ -99,18 +93,15 @@ def check_for_update(current_version):
 
 def download_update(download_url, progress_callback=None):
     """
-    downloads the new exe to a temp file and returns its path.
-    progress_callback(bytes_read, total_bytes) is called periodically
-    if given - total_bytes may be -1 if the server didn't send a
-    content-length header.
+    downloads the new exe to a temporary file and returns its path.
     """
     request = urllib.request.Request(
         download_url,
-        headers={"User-Agent": "piano-player-updater"},
+        headers={"user-agent": "piano-player-updater"},
     )
 
     with urllib.request.urlopen(request, timeout=30) as response:
-        total = int(response.headers.get("Content-Length", -1))
+        total = int(response.headers.get("content-length", -1))
 
         fd, temp_path = tempfile.mkstemp(
             suffix=".exe",
@@ -118,7 +109,7 @@ def download_update(download_url, progress_callback=None):
         )
 
         bytes_read = 0
-        chunk_size = 262144  # 256kb chunks
+        chunk_size = 262144
 
         with os.fdopen(fd, "wb") as out_file:
             while True:
@@ -133,59 +124,96 @@ def download_update(download_url, progress_callback=None):
                 if progress_callback is not None:
                     progress_callback(bytes_read, total)
 
-    log.info("update downloaded to %s (%s bytes)", temp_path, bytes_read)
+    if not os.path.isfile(temp_path):
+        raise RuntimeError("downloaded update does not exist")
+
+    if os.path.getsize(temp_path) == 0:
+        raise RuntimeError("downloaded update is empty")
+
+    log.info(
+        "update downloaded to %s (%s bytes)",
+        temp_path,
+        bytes_read,
+    )
 
     return temp_path
 
 
 def apply_update_and_relaunch(new_exe_path):
     """
-    swaps the currently-running exe for the newly downloaded one and
-    relaunches. a running exe can't overwrite itself on windows, so
-    this writes a tiny batch script that waits for this process to
-    exit, does the file swap, starts the new exe, then deletes itself.
-
-    only meaningful when actually running as a frozen exe (sys.frozen
-    is set by pyinstaller) - if you're running main.py directly as a
-    script, there's no exe to replace, so this just logs and returns.
+    launches a temporary batch updater which waits for the current
+    process to exit, replaces the executable, then starts the new one.
     """
     if not getattr(sys, "frozen", False):
         log.warning(
             "apply_update_and_relaunch called while running as a "
-            "script, not a frozen exe - nothing to replace"
+            "script, not a frozen exe"
         )
         return False
 
-    current_exe = sys.executable
+    current_exe = os.path.abspath(sys.executable)
+    new_exe_path = os.path.abspath(new_exe_path)
+
+    if not os.path.isfile(new_exe_path):
+        log.error("update file does not exist: %s", new_exe_path)
+        return False
+
+    log.info("current exe: %s", current_exe)
+    log.info("new exe: %s", new_exe_path)
+
     batch_path = os.path.join(
         tempfile.gettempdir(),
         "piano_player_update.bat",
     )
 
-    # ping loop as a crude "wait for the old process to fully exit"
-    # since batch has no native sleep/wait-for-pid - del retries a
-    # few times in case the OS hasn't released the file handle yet
+    pid = os.getpid()
+
     batch_contents = f"""@echo off
+setlocal
+
 :wait_loop
-tasklist /fi "PID eq {os.getpid()}" 2>NUL | find "{os.getpid()}" >NUL
+tasklist /fi "PID eq {pid}" 2>NUL | find "{pid}" >NUL
 if not errorlevel 1 (
-    ping 127.0.0.1 -n 2 >NUL
+    timeout /t 1 /nobreak >NUL
     goto wait_loop
 )
 
-move /y "{new_exe_path}" "{current_exe}" >NUL
+if not exist "{new_exe_path}" (
+    echo update file does not exist
+    exit /b 1
+)
+
+move /y "{new_exe_path}" "{current_exe}"
+
+if errorlevel 1 (
+    echo failed to replace executable
+    exit /b 1
+)
+
 start "" "{current_exe}"
+
+if errorlevel 1 (
+    echo failed to launch updated executable
+    exit /b 1
+)
+
 del "%~f0"
 """
 
-    with open(batch_path, "w") as handle:
-        handle.write(batch_contents)
+    try:
+        with open(batch_path, "w", encoding="utf-8") as handle:
+            handle.write(batch_contents)
 
-    log.info("launching update swap script: %s", batch_path)
+        log.info("launching update script: %s", batch_path)
 
-    subprocess.Popen(
-        ["cmd.exe", "/c", batch_path],
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+        subprocess.Popen(
+            ["cmd.exe", "/c", batch_path],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
+        )
 
-    return True
+        return True
+
+    except Exception:
+        log.exception("failed to launch update script")
+        return False

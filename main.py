@@ -2304,14 +2304,24 @@ class App:
         skipped_path = self.skipped_version_path()
 
         if not info.mandatory and os.path.exists(skipped_path):
-            with open(skipped_path, "r") as handle:
-                skipped_version = handle.read().strip()
+            try:
+                with open(skipped_path, "r", encoding="utf-8") as handle:
+                    skipped_version = handle.read().strip()
 
-            if skipped_version == info.version:
-                log.info("update %s already skipped by user", info.version)
-                return
+                if skipped_version == info.version:
+                    log.info(
+                        "update %s already skipped by user",
+                        info.version,
+                    )
+                    return
 
-        self.root.after(0, lambda: self.show_update_dialog(info))
+            except Exception:
+                log.exception("failed to read skipped version")
+
+        self.root.after(
+            0,
+            lambda: self.show_update_dialog(info),
+        )
 
     @staticmethod
     def skipped_version_path():
@@ -2447,14 +2457,26 @@ class App:
         log.info("user skipped update %s", info.version)
 
         try:
-            with open(self.skipped_version_path(), "w") as handle:
+            with open(
+                self.skipped_version_path(),
+                "w",
+                encoding="utf-8",
+            ) as handle:
                 handle.write(info.version)
+
         except Exception:
             log.exception("failed to persist skipped version")
 
         window.destroy()
 
-    def begin_update(self, info, window, update_button, progress_label):
+
+    def begin_update(
+        self,
+        info,
+        window,
+        update_button,
+        progress_label,
+    ):
         update_button.configure(state="disabled")
         progress_label.set("downloading...")
 
@@ -2464,15 +2486,23 @@ class App:
             daemon=True,
         ).start()
 
+
     def run_update_download(self, info, window, progress_label):
         def on_progress(bytes_read, total):
             if total > 0:
                 percent = int(bytes_read / total * 100)
-                text = f"downloading... {percent}% ({bytes_read // 1024} KB / {total // 1024} KB)"
+
+                text = (
+                    f"downloading... {percent}% "
+                    f"({bytes_read // 1024} KB / {total // 1024} KB)"
+                )
             else:
                 text = f"downloading... {bytes_read // 1024} KB"
 
-            self.root.after(0, lambda: progress_label.set(text))
+            self.root.after(
+                0,
+                lambda: progress_label.set(text),
+            )
 
         try:
             new_exe_path = updater.download_update(
@@ -2482,35 +2512,40 @@ class App:
 
         except Exception:
             log.exception("update download failed")
+
             self.root.after(
                 0,
                 lambda: progress_label.set(
-                    "download failed - check piano_player.log"
+                    "download failed - check piano_player.log",
                 ),
             )
             return
 
         self.root.after(
             0,
-            lambda: progress_label.set("installing and relaunching..."),
+            lambda: progress_label.set(
+                "installing and relaunching...",
+            ),
         )
 
-        applied = updater.apply_update_and_relaunch(new_exe_path)
+        applied = updater.apply_update_and_relaunch(
+            new_exe_path,
+        )
 
         if applied:
-            log.info("update applied, closing for relaunch")
+            log.info("update applied, exiting for relaunch")
             self.closing = True
-            self.root.destroy()
-        else:
-            # not running as a frozen exe (dev/script mode) - nothing
-            # to swap, just let them know instead of pretending it worked
-            self.root.after(
-                0,
-                lambda: progress_label.set(
-                    "not running as a packaged exe - can't self-update "
-                    "in script mode"
-                ),
-            )
+
+            # the batch file owns the rest of the update process.
+            os._exit(0)
+
+        self.root.after(
+            0,
+            lambda: progress_label.set(
+                "not running as a packaged exe - can't self-update "
+                "in script mode",
+            ),
+        )
 
     def show_admin_overlay(self):
         """
