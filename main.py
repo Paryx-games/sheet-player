@@ -570,14 +570,10 @@ def apply_timing_scale(event, scale_factor):
 def midi_to_sheet_text(midi_path):
     midi_file = mido.MidiFile(midi_path)
     ticks_per_beat = max(1, midi_file.ticks_per_beat)
-
-    # merge_tracks interleaves all tracks in true absolute-time order, so
-    # notes on different tracks/channels don't collide or corrupt each
-    # other's timing the way accumulating per-track time did before.
     merged = mido.merge_tracks(midi_file.tracks)
 
-    note_starts = {}  # (channel, note) -> start_tick
-    note_events = []  # (start_tick, end_tick, note)
+    note_starts = {}
+    note_events = []
     current_tick = 0
 
     for message in merged:
@@ -597,7 +593,6 @@ def midi_to_sheet_text(midi_path):
 
     note_events.sort(key=lambda item: (item[0], item[2]))
 
-    # group note-ons that started within a small tolerance into one chord
     tolerance_ticks = max(1, ticks_per_beat // 32)
     groups = []
     for start_tick, end_tick, note in note_events:
@@ -610,8 +605,11 @@ def midi_to_sheet_text(midi_path):
     def ticks_to_beats(ticks):
         return ticks / ticks_per_beat
 
-    lines = []
-    current_line = []
+    def format_beats(beats):
+        rounded = round(beats, 2)
+        return f"{rounded:g}"
+
+    lines, current_line = [], []
 
     def flush_token(token):
         current_line.append(token)
@@ -626,8 +624,10 @@ def midi_to_sheet_text(midi_path):
             rest_count = max(1, round(ticks_to_beats(gap_ticks)))
             flush_token("-" * rest_count)
 
+        beats = max(0.1, ticks_to_beats(group["end"] - group["start"]))
         chars = [midi_note_to_sheet_char(n) for n in sorted(set(group["notes"]))]
-        flush_token(chars[0] if len(chars) == 1 else "[" + "".join(chars) + "]")
+        body = chars[0] if len(chars) == 1 else "[" + "".join(chars) + "]"
+        flush_token(f"{body}:{format_beats(beats)}")
 
         previous_end_tick = group["end"]
 
@@ -635,7 +635,6 @@ def midi_to_sheet_text(midi_path):
         lines.append("".join(current_line))
 
     return "\n".join(lines)
-
 
 class Player:
     HOLD_RATIO = 0.9
