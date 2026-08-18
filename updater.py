@@ -14,6 +14,8 @@ import sys
 import tempfile
 import urllib.request
 
+import paths
+
 log = logging.getLogger("piano.updater")
 
 version_manifest_url = (
@@ -105,7 +107,7 @@ def download_update(download_url, progress_callback=None):
 
         fd, temp_path = tempfile.mkstemp(
             suffix=".exe",
-            prefix="piano_player_update_",
+            prefix=paths.TEMP_UPDATE_EXE_PREFIX,
         )
 
         bytes_read = 0
@@ -161,10 +163,7 @@ def apply_update_and_relaunch(new_exe_path):
     log.info("current exe: %s", current_exe)
     log.info("new exe: %s", new_exe_path)
 
-    batch_path = os.path.join(
-        tempfile.gettempdir(),
-        "piano_player_update.bat",
-    )
+    batch_path = str(paths.TEMP_UPDATE_BATCH_PATH)
 
     pid = os.getpid()
 

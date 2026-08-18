@@ -16,16 +16,17 @@ import win32con
 import win32gui
 import win32process
 
+import paths
 import updater
 
 CURRENT_VERSION = "1.2.0"
-LOG_PATH = "piano_player.log"
-SHEET_LIBRARY_FILE_NAME = "sheets.json"
+LOG_PATH = paths.LOG_PATH
+SHEET_LIBRARY_FILE_NAME = paths.SHEET_LIBRARY_FILE_NAME
 SHEET_FILE_EXTENSION = ".piano-sheet.json"
 MAX_SHEET_FILE_BYTES = 1_000_000
 
 logging.basicConfig(
-    filename=LOG_PATH,
+    filename=str(LOG_PATH),
     filemode="w",
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -237,18 +238,8 @@ class SheetLibrary:
     DEFAULT_SHEET_NAME = "Untitled sheet"
 
     def __init__(self):
-        app_data_directory = os.environ.get(
-            "LOCALAPPDATA",
-            os.path.expanduser("~"),
-        )
-        self.storage_directory = os.path.join(
-            app_data_directory,
-            "VirtualPianoPlayer",
-        )
-        self.storage_path = os.path.join(
-            self.storage_directory,
-            SHEET_LIBRARY_FILE_NAME,
-        )
+        self.storage_directory = str(paths.APP_DATA_DIR)
+        self.storage_path = str(paths.SHEET_LIBRARY_PATH)
         self.sheets = {self.DEFAULT_SHEET_NAME: ""}
         self.active_sheet_name = self.DEFAULT_SHEET_NAME
         self.settings = {}
@@ -976,7 +967,7 @@ class Player:
             # loop above used to just vanish because there was no except
             # clause, only finally. now it's logged AND shown to the user.
             log.exception("playback crashed")
-            self.on_error("playback crashed - check piano_player.log")
+            self.on_error("playback crashed - check the app log")
 
         finally:
             was_stopped = self.stop_requested
@@ -2325,7 +2316,7 @@ class App:
 
     @staticmethod
     def skipped_version_path():
-        return os.path.join(tempfile.gettempdir(), "piano_player_skip.txt")
+        return str(paths.SKIPPED_VERSION_PATH)
 
     def show_update_dialog(self, info):
         window = tk.Toplevel(self.root)
@@ -2516,7 +2507,7 @@ class App:
             self.root.after(
                 0,
                 lambda: progress_label.set(
-                    "download failed - check piano_player.log",
+                    "download failed - check the app log",
                 ),
             )
             return
@@ -2751,7 +2742,7 @@ class App:
         text.pack(fill="both", expand=True)
 
         try:
-            with open(LOG_PATH, "r", encoding="utf-8") as handle:
+            with open(paths.LOG_PATH, "r", encoding="utf-8") as handle:
                 content = handle.read()
         except FileNotFoundError:
             content = "no log written yet - hit start first"
@@ -2770,7 +2761,7 @@ class App:
 
     def refresh_log_text(self, text_widget):
         try:
-            with open(LOG_PATH, "r", encoding="utf-8") as handle:
+            with open(paths.LOG_PATH, "r", encoding="utf-8") as handle:
                 content = handle.read()
         except FileNotFoundError:
             content = "no log written yet - hit start first"
