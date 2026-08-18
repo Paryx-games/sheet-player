@@ -514,9 +514,20 @@ class SheetParser:
         return processed
 
 
-def midi_note_to_sheet_char(note_number):
+def midi_note_to_sheet_char(note_number, base_note=60):
+    """Map a MIDI note number to one of the 13 chromatic keys the sheet
+    format supports. The sheet format only has one octave's worth of keys,
+    so notes are transposed by whole octaves toward `base_note` (middle C)
+    rather than wrapped with a naive mod — this keeps the melodic shape
+    closer to correct, but notes more than half an octave from the piece's
+    center will still lose their original register."""
     mapping = "awsedftgyhujk"
-    return mapping[note_number % len(mapping)]
+    octave = 12
+    while note_number - base_note > octave // 2:
+        note_number -= octave
+    while base_note - note_number > octave // 2:
+        note_number += octave
+    return mapping[(note_number - base_note) % octave]
 
 
 def apply_timing_scale(event, scale_factor):
@@ -534,45 +545,72 @@ def apply_timing_scale(event, scale_factor):
 
 def midi_to_sheet_text(midi_path):
     midi_file = mido.MidiFile(midi_path)
-    note_starts = {}
-    note_events = []
-    current_time = 0
+    ticks_per_beat = max(1, midi_file.ticks_per_beat)
 
-    for track in midi_file.tracks:
-        current_time = 0
-        for message in track:
-            current_time += message.time
-            if message.type == "note_on" and message.velocity > 0:
-                note_starts.setdefault(message.note, current_time)
-            elif message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
-                if message.note in note_starts:
-                    start_time = note_starts.pop(message.note)
-                    duration = max(1, int(round((current_time - start_time) / max(1, midi_file.ticks_per_beat))))
-                    note_events.append((start_time, duration, message.note))
+    # merge_tracks interleaves all tracks in true absolute-time order, so
+    # notes on different tracks/channels don't collide or corrupt each
+    # other's timing the way accumulating per-track time did before.
+    merged = mido.merge_tracks(midi_file.tracks)
+
+    note_starts = {}  # (channel, note) -> start_tick
+    note_events = []  # (start_tick, end_tick, note)
+    current_tick = 0
+
+    for message in merged:
+        current_tick += message.time
+        if not hasattr(message, "note"):
+            continue
+        key = (getattr(message, "channel", 0), message.note)
+        if message.type == "note_on" and message.velocity > 0:
+            note_starts[key] = current_tick
+        elif message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
+            start_tick = note_starts.pop(key, None)
+            if start_tick is not None:
+                note_events.append((start_tick, current_tick, message.note))
 
     if not note_events:
         return ""
 
-    note_events.sort(key=lambda item: item[0])
-    output_lines = []
-    previous_end = 0
-    for _, duration, note_number in note_events:
-        gap = max(0, int(round((note_events[0][0] if False else 0))))
-        note_char = midi_note_to_sheet_char(note_number)
-        if output_lines and len(output_lines[-1]) < 24:
-            output_lines[-1] += note_char
-        else:
-            output_lines.append(note_char)
-        for _ in range(max(0, duration - 1)):
-            if len(output_lines[-1]) < 24:
-                output_lines[-1] += " "
-            else:
-                output_lines.append(" ")
+    note_events.sort(key=lambda item: (item[0], item[2]))
 
-    sheet = "\n".join(output_lines)
-    if not sheet:
-        return "a"
-    return sheet
+    # group note-ons that started within a small tolerance into one chord
+    tolerance_ticks = max(1, ticks_per_beat // 32)
+    groups = []
+    for start_tick, end_tick, note in note_events:
+        if groups and start_tick - groups[-1]["start"] <= tolerance_ticks:
+            groups[-1]["notes"].append(note)
+            groups[-1]["end"] = max(groups[-1]["end"], end_tick)
+        else:
+            groups.append({"start": start_tick, "end": end_tick, "notes": [note]})
+
+    def ticks_to_beats(ticks):
+        return ticks / ticks_per_beat
+
+    lines = []
+    current_line = []
+
+    def flush_token(token):
+        current_line.append(token)
+        if len(current_line) >= 20:
+            lines.append("".join(current_line))
+            current_line.clear()
+
+    previous_end_tick = groups[0]["start"]
+    for group in groups:
+        gap_ticks = group["start"] - previous_end_tick
+        if gap_ticks > tolerance_ticks:
+            rest_count = max(1, round(ticks_to_beats(gap_ticks)))
+            flush_token("-" * rest_count)
+
+        chars = [midi_note_to_sheet_char(n) for n in sorted(set(group["notes"]))]
+        flush_token(chars[0] if len(chars) == 1 else "[" + "".join(chars) + "]")
+
+        previous_end_tick = group["end"]
+
+    if current_line:
+        lines.append("".join(current_line))
+
+    return "\n".join(lines)
 
 
 class Player:
