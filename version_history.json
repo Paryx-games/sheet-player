@@ -1,5 +1,5 @@
 {
-    "note": "This is purely obsolete to log previous updates. This file is only for if I add build changing in the future.",
+    "note": "Release history for the Piano Player desktop app. This file records milestone updates and major feature changes.",
     "versions": [
         {
             "version": "1.0.0",
@@ -17,6 +17,12 @@
             "version": "1.2.0",
             "download_url": "https://github.com/Paryx-games/sheet-player/releases/download/v1.2.0/PianoPlayer.exe",
             "changelog": "Critical update! Fixes the auto updater (if it doesn't work, download from the github or go to this website: https://github.com/Paryx-games/sheet-player/releases/download/v1.2.0/PianoPlayer.exe",
+            "mandatory": true
+        },
+        {
+            "version": "1.3.0",
+            "download_url": "https://github.com/Paryx-games/sheet-player/releases/download/v1.3.0/PianoPlayer.exe",
+            "changelog": "PySide6 migration and premium UI refresh: more polished dark interface, improved sheet editor, and smoother playback controls while preserving the core piano automation workflow.",
             "mandatory": true
         }
     ]

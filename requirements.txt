@@ -3,3 +3,4 @@ psutil
 pydirectinput
 pywin32
 pyinstaller
+PySide6
