@@ -3,10 +3,8 @@ import json
 import logging
 import os
 import sys
-import tempfile
 import threading
 import time
-from typing import Optional
 
 import keyboard
 import psutil
@@ -14,11 +12,32 @@ import pydirectinput
 import win32con
 import win32gui
 import win32process
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QPropertyAnimation,
+    QEasingCurve,
+    QPoint,
+    QRect,
+    QRectF,
+    Property,
+    QParallelAnimationGroup,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QPainter,
+    QPainterPath,
+    QLinearGradient,
+    QFont,
+    QPen,
+    QBrush,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
-    QFormLayout,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -29,20 +48,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QScrollArea,
     QSlider,
-    QSplitter,
     QVBoxLayout,
     QWidget,
     QPushButton,
     QTextEdit,
     QComboBox,
     QCheckBox,
-    QSizePolicy,
+    QFrame,
 )
 
 import paths
 import updater
 
-CURRENT_VERSION = "1.3.0"
+CURRENT_VERSION = "1.4.0"
 LOG_PATH = paths.LOG_PATH
 SHEET_LIBRARY_FILE_NAME = paths.SHEET_LIBRARY_FILE_NAME
 SHEET_FILE_EXTENSION = ".piano-sheet.json"
@@ -57,16 +75,27 @@ logging.basicConfig(
 
 log = logging.getLogger("piano")
 
-APP_BG = "#070b12"
-APP_PANEL = "#111a24"
-APP_PANEL_ALT = "#151f2b"
-APP_BORDER = "#2b3746"
-APP_GLOW = "#70e0a4"
-APP_ACCENT = "#6ea8fe"
-APP_TEXT = "#edf3ff"
-APP_MUTED = "#8d99ab"
-APP_SUCCESS = "#59d98a"
-APP_DANGER = "#ff6b76"
+# ── design tokens ──────────────────────────────────────────────────────────
+# minimal dark glass palette - desaturated, layered translucency, one mint accent
+BG_BASE = QColor(10, 12, 16)
+BG_TOP = QColor(16, 19, 25)
+GLASS_FILL = QColor(255, 255, 255, 10)
+GLASS_FILL_HOVER = QColor(255, 255, 255, 16)
+GLASS_BORDER = QColor(255, 255, 255, 22)
+GLASS_BORDER_SOFT = QColor(255, 255, 255, 12)
+
+ACCENT = "#7ee8b8"
+ACCENT_DIM = "#4fa87f"
+ACCENT_QC = QColor("#7ee8b8")
+DANGER = "#ff8a94"
+WARN = "#f3c675"
+
+TEXT_PRIMARY = "#f2f5f8"
+TEXT_SECONDARY = "#9aa4b2"
+TEXT_FAINT = "#5b6472"
+
+FONT_FAMILY = "Segoe UI"
+MONO_FAMILY = "Cascadia Mono"
 
 DEFAULT_TEMPO = 120
 MIN_TEMPO = 30
@@ -655,13 +684,267 @@ class Player:
             self.on_finished(was_stopped)
 
 
+# ── glass ui primitives ─────────────────────────────────────────────────────
+
+class GlassPanel(QFrame):
+    """A rounded, faintly translucent panel with a hairline border - the base
+    surface every section sits on. Painted manually so radius/opacity stay
+    crisp regardless of stylesheet cascade."""
+
+    def __init__(self, radius=14, fill=None, border=None, parent=None):
+        super().__init__(parent)
+        self.radius = radius
+        self.fill = fill or GLASS_FILL
+        self.border = border or GLASS_BORDER_SOFT
+        self.setAttribute(Qt.WA_StyledBackground, False)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, self.radius, self.radius)
+        painter.fillPath(path, QBrush(self.fill))
+        painter.setPen(QPen(self.border, 1))
+        painter.drawPath(path)
+
+
+class AnimatedButton(QPushButton):
+    """Push button with a hover-lift + color glide instead of an instant
+    stylesheet swap - keeps hover state feeling alive without being gimmicky."""
+
+    def __init__(self, text, kind="default", parent=None):
+        super().__init__(text, parent)
+        self.kind = kind
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(36)
+        self._apply_palette()
+        self._hover_progress = 0.0
+        self._anim = QPropertyAnimation(self, b"hoverProgress")
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _apply_palette(self):
+        palettes = {
+            "default": (QColor(255, 255, 255, 14), QColor(255, 255, 255, 26), TEXT_PRIMARY),
+            "accent": (QColor(126, 232, 184, 40), QColor(126, 232, 184, 90), "#0c1712"),
+            "danger": (QColor(255, 138, 148, 30), QColor(255, 138, 148, 70), "#2a0f12"),
+        }
+        self.base_fill, self.hover_fill, self.text_color = palettes.get(self.kind, palettes["default"])
+
+    def getHoverProgress(self):
+        return self._hover_progress
+
+    def setHoverProgress(self, value):
+        self._hover_progress = value
+        self.update()
+
+    hoverProgress = Property(float, getHoverProgress, setHoverProgress)
+
+    def enterEvent(self, event):
+        self._anim.stop()
+        self._anim.setStartValue(self._hover_progress)
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._anim.stop()
+        self._anim.setStartValue(self._hover_progress)
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 9, 9)
+
+        t = self._hover_progress
+        fill = QColor(
+            int(self.base_fill.red() + (self.hover_fill.red() - self.base_fill.red()) * t),
+            int(self.base_fill.green() + (self.hover_fill.green() - self.base_fill.green()) * t),
+            int(self.base_fill.blue() + (self.hover_fill.blue() - self.base_fill.blue()) * t),
+            int(self.base_fill.alpha() + (self.hover_fill.alpha() - self.base_fill.alpha()) * t),
+        )
+        if not self.isEnabled():
+            fill = QColor(255, 255, 255, 6)
+
+        # subtle lift: shift content rect up by 1px at full hover
+        lift = -1 * t
+        painter.translate(0, lift)
+        painter.fillPath(path, QBrush(fill))
+        painter.setPen(QPen(QColor(255, 255, 255, int(18 + 20 * t)), 1))
+        painter.drawPath(path)
+        painter.translate(0, -lift)
+
+        painter.setPen(QColor(self.text_color) if self.isEnabled() else QColor(TEXT_FAINT))
+        font = self.font()
+        font.setWeight(QFont.DemiBold)
+        painter.setFont(font)
+        painter.drawText(self.rect().adjusted(0, int(lift), 0, int(lift)), Qt.AlignCenter, self.text())
+
+
+class PulseDot(QWidget):
+    """Small breathing status dot - green when idle/ready, amber mid-motion,
+    red on error. Loops a soft radius pulse via QPropertyAnimation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(10, 10)
+        self._radius = 3.0
+        self.color = QColor(ACCENT)
+        self._anim = QPropertyAnimation(self, b"radius")
+        self._anim.setDuration(1100)
+        self._anim.setStartValue(3.0)
+        self._anim.setEndValue(4.6)
+        self._anim.setEasingCurve(QEasingCurve.InOutSine)
+        self._anim.setLoopCount(-1)
+        self._anim.finished.connect(self._reverse)
+        self._direction = 1
+
+    def _reverse(self):
+        pass
+
+    def start(self):
+        self._anim.start()
+
+    def getRadius(self):
+        return self._radius
+
+    def setRadius(self, value):
+        self._radius = value
+        self.update()
+
+    radius = Property(float, getRadius, setRadius)
+
+    def set_color(self, hex_color):
+        self.color = QColor(hex_color)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = QPoint(5, 5)
+        glow = QColor(self.color)
+        glow.setAlpha(60)
+        painter.setBrush(QBrush(glow))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(center, self._radius + 3, self._radius + 3)
+        painter.setBrush(QBrush(self.color))
+        painter.drawEllipse(center, self._radius, self._radius)
+
+
+class BackgroundCanvas(QWidget):
+    """Root background: vertical gradient + two soft radial glows, painted
+    once behind everything so glass panels have something to sit on top of."""
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+
+        gradient = QLinearGradient(0, 0, 0, rect.height())
+        gradient.setColorAt(0.0, BG_TOP)
+        gradient.setColorAt(1.0, BG_BASE)
+        painter.fillRect(rect, gradient)
+
+        glow1 = QLinearGradient(0, 0, rect.width() * 0.5, rect.height() * 0.5)
+        radial_color = QColor(ACCENT)
+        radial_color.setAlpha(10)
+        painter.setBrush(QBrush(radial_color))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPoint(int(rect.width() * 0.15), int(rect.height() * 0.05)), 380, 260)
+
+        radial_color2 = QColor("#6ea8fe")
+        radial_color2.setAlpha(7)
+        painter.setBrush(QBrush(radial_color2))
+        painter.drawEllipse(QPoint(int(rect.width() * 0.95), int(rect.height() * 0.9)), 340, 240)
+
+
+def make_shadow(blur=28, alpha=140, y_offset=6):
+    effect = QGraphicsDropShadowEffect()
+    effect.setBlurRadius(blur)
+    effect.setOffset(0, y_offset)
+    effect.setColor(QColor(0, 0, 0, alpha))
+    return effect
+
+
+class NotePill(QPushButton):
+    """One note/chord/rest token in the playback view. Selection and
+    'already played' states glide smoothly via a background-color animation
+    instead of hard style swaps, so scanning the sheet during playback feels
+    fluid rather than flickery."""
+
+    def __init__(self, text, is_rest, parent=None):
+        super().__init__(text, parent)
+        self.is_rest = is_rest
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumSize(30, 30)
+        self.setFont(QFont(MONO_FAMILY, 11, QFont.DemiBold))
+        self._state = "upcoming"  # upcoming | played | current
+        self._bg = QColor(24, 28, 34, 235)
+        self._anim = QPropertyAnimation(self, b"bgColor")
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def getBgColor(self):
+        return self._bg
+
+    def setBgColor(self, value):
+        self._bg = value
+        self.update()
+
+    bgColor = Property(QColor, getBgColor, setBgColor)
+
+    def set_state(self, state):
+        if state == self._state:
+            return
+        self._state = state
+        targets = {
+            "current": QColor(126, 232, 184, 235),
+            "played": QColor(255, 255, 255, 10),
+            "upcoming": QColor(255, 255, 255, 18) if not self.is_rest else QColor(255, 255, 255, 6),
+        }
+        self._anim.stop()
+        self._anim.setStartValue(self._bg)
+        self._anim.setEndValue(targets[state])
+        self._anim.start()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 7, 7)
+        painter.fillPath(path, QBrush(self._bg))
+
+        if self._state == "current":
+            painter.setPen(QPen(QColor(126, 232, 184, 255), 1.4))
+            painter.drawPath(path)
+            text_color = QColor("#0c1712")
+        elif self._state == "played":
+            painter.setPen(QPen(QColor(255, 255, 255, 14), 1))
+            painter.drawPath(path)
+            text_color = QColor(TEXT_FAINT)
+        else:
+            painter.setPen(QPen(QColor(255, 255, 255, 20), 1))
+            painter.drawPath(path)
+            text_color = QColor(TEXT_FAINT) if self.is_rest else QColor(TEXT_PRIMARY)
+
+        painter.setPen(text_color)
+        painter.setFont(self.font())
+        painter.drawText(self.rect(), Qt.AlignCenter, self.text())
+
+
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("virtual piano player")
-        self.resize(1100, 780)
-        self.setMinimumSize(860, 620)
-        self.setStyleSheet(f"background: {APP_BG}; color: {APP_TEXT}; font-family: 'Segoe UI';")
+        self.resize(1180, 800)
+        self.setMinimumSize(900, 640)
 
         self.events = []
         self.note_buttons = {}
@@ -687,239 +970,428 @@ class App(QMainWindow):
         self.window_targets = []
         self.active_target = None
         self.player = Player(self.note_changed, self.player_error, self.playback_finished)
+        self._sidebar_anim = None
+        self._sidebar_width = 260
         self._build_ui()
         self.load_active_sheet()
         self.refresh_sheet_list()
         self._register_hotkeys()
         if not is_admin():
-            self.show_admin_overlay()
+            QTimer.singleShot(200, self.show_admin_overlay)
+
+    # ── ui construction ─────────────────────────────────────────────────
 
     def _build_ui(self):
-        container = QWidget(self)
-        container.setStyleSheet(f"background: {APP_BG};")
-        self.setCentralWidget(container)
+        canvas = BackgroundCanvas(self)
+        self.setCentralWidget(canvas)
 
-        root_layout = QVBoxLayout(container)
-        root_layout.setContentsMargins(18, 16, 18, 16)
-        root_layout.setSpacing(10)
+        root_layout = QVBoxLayout(canvas)
+        root_layout.setContentsMargins(20, 18, 20, 18)
+        root_layout.setSpacing(12)
 
-        header = QWidget()
-        header.setStyleSheet(f"background: {APP_PANEL}; border:1px solid {APP_BORDER};")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 12, 16, 12)
+        root_layout.addWidget(self._build_header())
+        root_layout.addWidget(self._build_target_bar())
 
-        badge = QLabel("Piano")
-        badge.setStyleSheet(f"background: {APP_GLOW}; color: {APP_BG}; font-weight: 700; padding: 6px 10px; border-radius: 5px;")
-        header_layout.addWidget(badge)
+        self.workspace = QWidget()
+        split_layout = QHBoxLayout(self.workspace)
+        split_layout.setContentsMargins(0, 0, 0, 0)
+        split_layout.setSpacing(12)
 
+        self.sidebar = self._build_sidebar()
+        split_layout.addWidget(self.sidebar)
+        split_layout.addWidget(self._build_content_panel(), 1)
+
+        root_layout.addWidget(self.workspace, 1)
+        root_layout.addWidget(self._build_controls())
+        root_layout.addWidget(self._build_status_bar())
+        root_layout.addWidget(self._build_loop_panel())
+
+        if not self.sidebar_visible:
+            self.sidebar.setMaximumWidth(0)
+            self.sidebar_toggle_button.setText("show sheets")
+
+    def _section_label(self, text, faint=None):
+        label = QLabel(text)
+        label.setStyleSheet(f"color:{faint or TEXT_SECONDARY}; font-size:11px; letter-spacing:0.5px;")
+        return label
+
+    def _build_header(self):
+        header = GlassPanel(radius=16)
+        header.setGraphicsEffect(make_shadow(24, 120, 4))
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(20, 14, 18, 14)
+        layout.setSpacing(12)
+
+        badge = QLabel("♪")
+        badge.setFixedSize(34, 34)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet(
+            f"background: rgba(126,232,184,0.16); color:{ACCENT}; font-size:17px; "
+            f"font-weight:700; border-radius:9px; border: 1px solid rgba(126,232,184,0.35);"
+        )
+        layout.addWidget(badge)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
         title = QLabel("virtual piano player")
-        title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        header_layout.addWidget(title)
+        title.setStyleSheet(f"color:{TEXT_PRIMARY}; font-size:17px; font-weight:650;")
+        sub = QLabel("click any note to jump playback there")
+        sub.setStyleSheet(f"color:{TEXT_FAINT}; font-size:11px;")
+        title_box.addWidget(title)
+        title_box.addWidget(sub)
+        layout.addLayout(title_box)
+        layout.addStretch()
 
-        sub = QLabel("click notes to jump")
-        sub.setStyleSheet(f"color: {APP_MUTED}; font-size: 11px;")
-        header_layout.addWidget(sub)
-        header_layout.addStretch()
+        self.status_dot_small = PulseDot()
+        self.status_dot_small.start()
+        layout.addWidget(self.status_dot_small)
 
-        self.sidebar_toggle_button = QPushButton("hide sheets")
+        self.sidebar_toggle_button = AnimatedButton("hide sheets")
+        self.sidebar_toggle_button.setFixedWidth(112)
         self.sidebar_toggle_button.clicked.connect(self.toggle_sidebar)
-        self.sidebar_toggle_button.setStyleSheet(self._button_style())
-        header_layout.addWidget(self.sidebar_toggle_button)
+        layout.addWidget(self.sidebar_toggle_button)
 
-        root_layout.addWidget(header)
+        return header
 
-        self.target_bar = QWidget()
-        self.target_bar.setStyleSheet(f"background: {APP_PANEL}; border:1px solid {APP_BORDER};")
-        bar_layout = QHBoxLayout(self.target_bar)
-        bar_layout.setContentsMargins(16, 10, 16, 10)
+    def _build_target_bar(self):
+        self.target_bar = GlassPanel(radius=14)
+        layout = QHBoxLayout(self.target_bar)
+        layout.setContentsMargins(18, 10, 18, 10)
+        layout.setSpacing(10)
 
         label = QLabel("send input to")
-        label.setStyleSheet("font-weight: 700;")
-        bar_layout.addWidget(label)
+        label.setStyleSheet(f"color:{TEXT_SECONDARY}; font-weight:600; font-size:12px;")
+        layout.addWidget(label)
 
         self.mode_box = QComboBox()
         self.mode_box.addItems(["whatever's focused", "specific window/exe"])
         self.mode_box.setCurrentIndex(1 if self.target_mode == "specific" else 0)
         self.mode_box.currentIndexChanged.connect(self.on_mode_change)
-        bar_layout.addWidget(self.mode_box)
+        self.mode_box.setStyleSheet(self._combo_style())
+        layout.addWidget(self.mode_box)
 
         self.window_box = QComboBox()
         self.window_box.setMinimumWidth(300)
         self.window_box.currentIndexChanged.connect(self.on_window_selected)
-        bar_layout.addWidget(self.window_box)
+        self.window_box.setStyleSheet(self._combo_style())
+        layout.addWidget(self.window_box)
 
-        self.refresh_button = QPushButton("refresh")
+        self.refresh_button = AnimatedButton("refresh")
+        self.refresh_button.setFixedWidth(90)
         self.refresh_button.clicked.connect(self.refresh_windows)
-        self.refresh_button.setStyleSheet(self._button_style())
-        bar_layout.addWidget(self.refresh_button)
+        layout.addWidget(self.refresh_button)
 
         self.target_label = QLabel("(none selected)")
-        self.target_label.setStyleSheet(f"color: {APP_MUTED};")
-        bar_layout.addWidget(self.target_label)
-        bar_layout.addStretch()
+        self.target_label.setStyleSheet(f"color:{TEXT_FAINT}; font-size:12px;")
+        layout.addWidget(self.target_label)
+        layout.addStretch()
 
-        root_layout.addWidget(self.target_bar)
+        return self.target_bar
 
-        self.workspace = QWidget()
-        self.workspace.setStyleSheet(f"background:{APP_BG};")
-        split_layout = QHBoxLayout(self.workspace)
-        split_layout.setContentsMargins(0, 0, 0, 0)
-        split_layout.setSpacing(10)
+    def _build_sidebar(self):
+        sidebar = GlassPanel(radius=14)
+        sidebar.setFixedWidth(self._sidebar_width)
+        sidebar.setGraphicsEffect(make_shadow(20, 100, 4))
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
 
-        self.sidebar = QWidget()
-        self.sidebar.setStyleSheet(f"background:{APP_PANEL}; border:1px solid {APP_BORDER};")
-        sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(10, 10, 10, 10)
+        title = QLabel("Sheets")
+        title.setStyleSheet(f"color:{TEXT_PRIMARY}; font-size:15px; font-weight:650;")
+        layout.addWidget(title)
 
-        sidebar_title = QLabel("Sheets")
-        sidebar_title.setStyleSheet("font-size: 18px; font-weight: 700;")
-        sidebar_layout.addWidget(sidebar_title)
-
-        sidebar_caption = QLabel("Saved locally on this device")
-        sidebar_caption.setStyleSheet(f"color:{APP_MUTED}; font-size: 11px;")
-        sidebar_layout.addWidget(sidebar_caption)
+        caption = self._section_label("saved locally on this device", TEXT_FAINT)
+        layout.addWidget(caption)
 
         self.sheet_list = QListWidget()
-        self.sheet_list.setStyleSheet(
-            f"background: #0d1219; border:1px solid {APP_BORDER}; color: {APP_TEXT}; selection-background-color: #2b7d5d;"
-        )
+        self.sheet_list.setStyleSheet(f"""
+            QListWidget {{
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 9px;
+                color: {TEXT_PRIMARY};
+                padding: 4px;
+                font-size: 13px;
+                outline: 0;
+            }}
+            QListWidget::item {{
+                padding: 8px 8px;
+                border-radius: 6px;
+                margin: 1px 0;
+            }}
+            QListWidget::item:selected {{
+                background: rgba(126,232,184,0.18);
+                color: {ACCENT};
+            }}
+            QListWidget::item:hover:!selected {{
+                background: rgba(255,255,255,0.05);
+            }}
+        """)
         self.sheet_list.itemClicked.connect(self.on_sheet_selected)
-        sidebar_layout.addWidget(self.sheet_list, 1)
+        layout.addWidget(self.sheet_list, 1)
 
-        action_box = QWidget()
-        action_box.setStyleSheet(f"background:{APP_PANEL};")
-        action_layout = QVBoxLayout(action_box)
-        action_layout.setContentsMargins(0, 0, 0, 0)
-        for label, callback in [
-            ("New sheet", self.create_sheet),
-            ("Rename", self.rename_sheet),
-            ("Delete", self.delete_sheet),
-            ("Validate", self.validate_active_sheet),
-            ("Import sheet", self.import_sheet),
-            ("Export sheet", self.export_sheet),
+        for label, callback, kind in [
+            ("New sheet", self.create_sheet, "default"),
+            ("Rename", self.rename_sheet, "default"),
+            ("Delete", self.delete_sheet, "danger"),
+            ("Validate", self.validate_active_sheet, "default"),
+            ("Import sheet", self.import_sheet, "default"),
+            ("Export sheet", self.export_sheet, "default"),
         ]:
-            btn = QPushButton(label)
+            btn = AnimatedButton(label, kind=kind)
             btn.clicked.connect(callback)
-            btn.setStyleSheet(self._button_style())
-            action_layout.addWidget(btn)
-        sidebar_layout.addWidget(action_box)
+            layout.addWidget(btn)
 
+        return sidebar
+
+    def _build_content_panel(self):
         self.content_panel = QWidget()
-        self.content_panel.setStyleSheet(f"background:{APP_BG};")
         content_layout = QVBoxLayout(self.content_panel)
         content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(8)
+        content_layout.setSpacing(0)
+
+        self.editor_wrap = GlassPanel(radius=14)
+        self.editor_wrap.setGraphicsEffect(make_shadow(20, 100, 4))
+        editor_layout = QVBoxLayout(self.editor_wrap)
+        editor_layout.setContentsMargins(4, 4, 4, 4)
 
         self.editor = QTextEdit()
-        self.editor.setStyleSheet("background: #0d1219; color: #edf6ff; border:1px solid #2b3746; font-family: 'Cascadia Mono'; font-size: 12px;")
+        self.editor.setStyleSheet(f"""
+            QTextEdit {{
+                background: rgba(0,0,0,0.22);
+                color: {TEXT_PRIMARY};
+                border: none;
+                border-radius: 11px;
+                padding: 14px;
+                font-family: '{MONO_FAMILY}';
+                font-size: 13px;
+                selection-background-color: rgba(126,232,184,0.3);
+            }}
+        """)
         self.editor.textChanged.connect(self.on_editor_changed)
-        self.editor.setVisible(True)
-        content_layout.addWidget(self.editor)
+        editor_layout.addWidget(self.editor)
+        content_layout.addWidget(self.editor_wrap, 1)
+
+        self.notes_wrap = GlassPanel(radius=14)
+        self.notes_wrap.setGraphicsEffect(make_shadow(20, 100, 4))
+        notes_wrap_layout = QVBoxLayout(self.notes_wrap)
+        notes_wrap_layout.setContentsMargins(4, 4, 4, 4)
 
         self.sheet_notes = QWidget()
-        self.sheet_notes.setStyleSheet("background: #0d1219; border:1px solid #2b3746;")
+        self.sheet_notes.setStyleSheet("background: transparent;")
         self.sheet_notes_layout = QVBoxLayout(self.sheet_notes)
-        self.sheet_notes_layout.setContentsMargins(12, 12, 12, 12)
-        self.sheet_notes_layout.setSpacing(8)
+        self.sheet_notes_layout.setContentsMargins(14, 14, 14, 14)
+        self.sheet_notes_layout.setSpacing(6)
 
         self.notes_scroll = QScrollArea()
         self.notes_scroll.setWidget(self.sheet_notes)
         self.notes_scroll.setWidgetResizable(True)
-        self.notes_scroll.setStyleSheet("background: #0d1219; border:1px solid #2b3746;")
+        self.notes_scroll.setStyleSheet("""
+            QScrollArea { background: rgba(0,0,0,0.22); border:none; border-radius:11px; }
+            QScrollBar:vertical { background: transparent; width: 10px; margin: 4px; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,0.14); border-radius: 5px; min-height: 30px; }
+            QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.24); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
         self.notes_scroll.setVisible(False)
-        content_layout.addWidget(self.notes_scroll)
+        notes_wrap_layout.addWidget(self.notes_scroll)
+        content_layout.addWidget(self.notes_wrap, 1)
+        self.notes_wrap.setVisible(False)
 
-        self.controls = QWidget()
-        self.controls.setStyleSheet(f"background:{APP_PANEL}; border:1px solid {APP_BORDER};")
-        controls_layout = QHBoxLayout(self.controls)
-        controls_layout.setContentsMargins(12, 12, 12, 12)
+        return self.content_panel
 
-        for label, callback, state in [
-            ("start  [f6]", self.start, True),
-            ("stop  [f7]", self.stop, True),
-            ("pause  [f9]", self.toggle_pause, False),
-            ("submit", self.submit, True),
-            ("edit", self.edit, True),
-            ("exit  [f8]", self.exit_program, True),
-            ("view log", self.show_log, True),
+    def _build_controls(self):
+        self.controls = GlassPanel(radius=14)
+        self.controls.setGraphicsEffect(make_shadow(20, 100, 4))
+        layout = QHBoxLayout(self.controls)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        self.transport_buttons = {}
+        for key, label, callback, kind, enabled in [
+            ("start", "▶  start   f6", self.start, "accent", True),
+            ("stop", "■  stop   f7", self.stop, "danger", True),
+            ("pause", "❚❚  pause   f9", self.toggle_pause, "default", False),
+            ("submit", "submit", self.submit, "default", True),
+            ("edit", "edit", self.edit, "default", True),
+            ("exit", "exit   f8", self.exit_program, "default", True),
+            ("log", "view log", self.show_log, "default", True),
         ]:
-            btn = QPushButton(label)
+            btn = AnimatedButton(label, kind=kind)
             btn.clicked.connect(callback)
-            btn.setStyleSheet(self._button_style())
-            btn.setEnabled(state)
-            controls_layout.addWidget(btn)
-        controls_layout.addStretch()
+            btn.setEnabled(enabled)
+            btn.setMinimumWidth(70)
+            self.transport_buttons[key] = btn
+            layout.addWidget(btn)
+
+        layout.addStretch()
 
         tempo_label = QLabel("tempo")
-        tempo_label.setStyleSheet(f"color:{APP_MUTED};")
-        controls_layout.addWidget(tempo_label)
+        tempo_label.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:12px; font-weight:600;")
+        layout.addWidget(tempo_label)
+
+        self.tempo_value_label = QLabel(str(self.tempo))
+        self.tempo_value_label.setStyleSheet(f"color:{ACCENT}; font-size:12px; font-weight:700; min-width:30px;")
+        layout.addWidget(self.tempo_value_label)
+
         self.tempo_slider = QSlider(Qt.Horizontal)
         self.tempo_slider.setRange(MIN_TEMPO, MAX_TEMPO)
         self.tempo_slider.setValue(self.tempo)
         self.tempo_slider.valueChanged.connect(self.set_tempo)
-        self.tempo_slider.setMinimumWidth(200)
-        controls_layout.addWidget(self.tempo_slider)
+        self.tempo_slider.setMinimumWidth(190)
+        self.tempo_slider.setStyleSheet(self._slider_style())
+        layout.addWidget(self.tempo_slider)
 
-        root_layout.addWidget(self.workspace)
-        root_layout.addWidget(self.controls)
+        return self.controls
 
-        self.status_widget = QWidget()
-        self.status_widget.setStyleSheet(f"background:{APP_PANEL}; border:1px solid {APP_BORDER};")
-        status_layout = QHBoxLayout(self.status_widget)
-        status_layout.setContentsMargins(12, 8, 12, 8)
+    def _build_status_bar(self):
+        self.status_widget = GlassPanel(radius=12)
+        layout = QHBoxLayout(self.status_widget)
+        layout.setContentsMargins(16, 9, 16, 9)
+
+        self.status_dot = PulseDot()
+        self.status_dot.start()
+        layout.addWidget(self.status_dot)
+
         self.status_label = QLabel(self.status)
-        self.status_label.setStyleSheet(f"color:{APP_SUCCESS}; font-weight: 700;")
-        status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
-        self.position_label = QLabel(self.position)
-        self.position_label.setStyleSheet(f"color:{APP_MUTED};")
-        status_layout.addWidget(self.position_label)
-        root_layout.addWidget(self.status_widget)
+        self.status_label.setStyleSheet(f"color:{TEXT_PRIMARY}; font-weight:600; font-size:12px; margin-left:6px;")
+        layout.addWidget(self.status_label)
+        layout.addStretch()
 
-        self.loop_panel = QWidget()
-        self.loop_panel.setStyleSheet(f"background:{APP_BG}; color:{APP_TEXT};")
-        loop_layout = QHBoxLayout(self.loop_panel)
+        self.position_label = QLabel(self.position)
+        self.position_label.setStyleSheet(f"color:{TEXT_FAINT}; font-size:12px;")
+        layout.addWidget(self.position_label)
+
+        return self.status_widget
+
+    def _build_loop_panel(self):
+        self.loop_panel = GlassPanel(radius=12)
+        layout = QHBoxLayout(self.loop_panel)
+        layout.setContentsMargins(16, 9, 16, 9)
+        layout.setSpacing(8)
+
         self.loop_checkbox = QCheckBox("repeat playback")
         self.loop_checkbox.setChecked(self.loop_enabled)
         self.loop_checkbox.toggled.connect(self.set_loop_enabled)
-        loop_layout.addWidget(self.loop_checkbox)
+        self.loop_checkbox.setStyleSheet(f"""
+            QCheckBox {{ color:{TEXT_SECONDARY}; font-size:12px; font-weight:600; spacing:8px; }}
+            QCheckBox::indicator {{ width:16px; height:16px; border-radius:4px; border:1px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.04); }}
+            QCheckBox::indicator:checked {{ background:{ACCENT}; border-color:{ACCENT}; }}
+        """)
+        layout.addWidget(self.loop_checkbox)
+
         self.loop_scope_box = QComboBox()
         self.loop_scope_box.addItems(["whole sheet", "selected range"])
         self.loop_scope_box.setCurrentText(self.loop_scope)
         self.loop_scope_box.currentTextChanged.connect(self.set_loop_scope)
-        loop_layout.addWidget(self.loop_scope_box)
-        loop_layout.addWidget(QLabel("from"))
+        self.loop_scope_box.setStyleSheet(self._combo_style())
+        layout.addWidget(self.loop_scope_box)
+
+        layout.addWidget(self._section_label("from"))
         self.loop_start_box = QLineEdit(self.loop_start)
-        loop_layout.addWidget(self.loop_start_box)
-        loop_layout.addWidget(QLabel("to"))
+        self.loop_start_box.setFixedWidth(50)
+        self.loop_start_box.setStyleSheet(self._line_edit_style())
+        layout.addWidget(self.loop_start_box)
+
+        layout.addWidget(self._section_label("to"))
         self.loop_end_box = QLineEdit(self.loop_end)
-        loop_layout.addWidget(self.loop_end_box)
-        loop_layout.addWidget(QLabel("plays (0 = infinite)"))
+        self.loop_end_box.setFixedWidth(50)
+        self.loop_end_box.setStyleSheet(self._line_edit_style())
+        layout.addWidget(self.loop_end_box)
+
+        layout.addWidget(self._section_label("plays (0 = infinite)"))
         self.loop_repeats_box = QLineEdit(self.loop_repeats)
-        loop_layout.addWidget(self.loop_repeats_box)
-        root_layout.addWidget(self.loop_panel)
+        self.loop_repeats_box.setFixedWidth(50)
+        self.loop_repeats_box.setStyleSheet(self._line_edit_style())
+        layout.addWidget(self.loop_repeats_box)
 
-        split_layout.addWidget(self.sidebar)
-        split_layout.addWidget(self.content_panel)
-        self.workspace.setLayout(split_layout)
+        layout.addStretch()
+        return self.loop_panel
 
-        self.toggle_sidebar_visibility()
+    # ── style helpers ────────────────────────────────────────────────────
 
-    def _button_style(self):
-        return (
-            "QPushButton { background:#1b2430; color:#edf3ff; border:1px solid #34404d; border-radius:6px; padding:7px 12px; font-weight:700; } "
-            "QPushButton:hover { background:#223040; border-color:#4d6d8b; } "
-            "QPushButton:disabled { background:#1d1f24; color:#66707a; }"
-        )
+    def _combo_style(self):
+        return f"""
+            QComboBox {{
+                background: rgba(255,255,255,0.05);
+                color: {TEXT_PRIMARY};
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 7px;
+                padding: 6px 10px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QComboBox:hover {{ border-color: rgba(255,255,255,0.24); }}
+            QComboBox::drop-down {{ border: none; width: 22px; }}
+            QComboBox QAbstractItemView {{
+                background: #14181f;
+                color: {TEXT_PRIMARY};
+                border: 1px solid rgba(255,255,255,0.14);
+                selection-background-color: rgba(126,232,184,0.2);
+                outline: 0;
+            }}
+        """
 
-    def toggle_sidebar_visibility(self):
-        if self.sidebar_visible:
-            self.sidebar.show()
-        else:
-            self.sidebar.hide()
+    def _line_edit_style(self):
+        return f"""
+            QLineEdit {{
+                background: rgba(255,255,255,0.05);
+                color: {TEXT_PRIMARY};
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 7px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QLineEdit:focus {{ border-color: {ACCENT}; }}
+        """
+
+    def _slider_style(self):
+        return f"""
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: rgba(255,255,255,0.12);
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {ACCENT};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {TEXT_PRIMARY};
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: {ACCENT};
+            }}
+        """
+
+    # ── sidebar animation ────────────────────────────────────────────────
+
+    def toggle_sidebar(self):
+        self.sidebar_visible = not self.sidebar_visible
+        target_width = self._sidebar_width if self.sidebar_visible else 0
+
+        if self._sidebar_anim is not None:
+            self._sidebar_anim.stop()
+        self._sidebar_anim = QPropertyAnimation(self.sidebar, b"maximumWidth")
+        self._sidebar_anim.setDuration(240)
+        self._sidebar_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._sidebar_anim.setStartValue(self.sidebar.maximumWidth() if self.sidebar.maximumWidth() < 10000 else self.sidebar.width())
+        self._sidebar_anim.setEndValue(target_width)
+        self._sidebar_anim.start()
+
+        self.sidebar_toggle_button.setText("show sheets" if not self.sidebar_visible else "hide sheets")
+        self.save_library()
+
+    # ── data / behavior (unchanged from original) ───────────────────────
 
     def set_tempo(self, value):
         self.tempo = value
+        self.tempo_value_label.setText(str(value))
         self.save_library()
 
     def set_loop_enabled(self, enabled):
@@ -987,6 +1459,9 @@ class App(QMainWindow):
         self.events = []
         self.selected_event = 0
         self.load_active_sheet()
+        self.editing = True
+        self.notes_wrap.setVisible(False)
+        self.editor_wrap.setVisible(True)
         self.status = "editing saved sheet"
         self.set_status(self.status)
 
@@ -1109,11 +1584,6 @@ class App(QMainWindow):
             return
         self.set_status("sheet exported")
 
-    def toggle_sidebar(self):
-        self.sidebar_visible = not self.sidebar_visible
-        self.toggle_sidebar_visibility()
-        self.save_library()
-
     def on_mode_change(self, _index):
         self.target_mode = "specific" if self.mode_box.currentIndex() == 1 else "foreground"
         self.refresh_windows()
@@ -1149,7 +1619,7 @@ class App(QMainWindow):
         self.target_label.setText(self.selected_window_label)
 
     def player_error(self, message):
-        self.set_status(message)
+        self.set_status(message, is_error=True)
 
     def submit(self):
         if self.player.playing:
@@ -1166,7 +1636,8 @@ class App(QMainWindow):
         self.playback_start_index = 0
         self.loop_start = "1"
         self.loop_end = str(len(self.events))
-        self.editor.setVisible(False)
+        self.editor_wrap.setVisible(False)
+        self.notes_wrap.setVisible(True)
         self.notes_scroll.setVisible(True)
         self.render_notes()
         self.set_status(f"ready • {len(self.events)} notes")
@@ -1175,17 +1646,15 @@ class App(QMainWindow):
         if self.player.playing:
             return
         self.editing = True
-        self.notes_scroll.setVisible(False)
-        self.editor.setVisible(True)
+        self.notes_wrap.setVisible(False)
+        self.editor_wrap.setVisible(True)
         self.set_status("editing")
 
     def render_notes(self):
-        for child in self.sheet_notes.children():
-            if child is not None:
-                child.deleteLater()
-        self.sheet_notes_layout = QVBoxLayout(self.sheet_notes)
-        self.sheet_notes_layout.setContentsMargins(12, 12, 12, 12)
-        self.sheet_notes_layout.setSpacing(8)
+        while self.sheet_notes_layout.count():
+            child = self.sheet_notes_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
         self.note_buttons = {}
 
         lines = {}
@@ -1197,36 +1666,28 @@ class App(QMainWindow):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
             line_label = QLabel(f"{line_number + 1:03}")
-            line_label.setStyleSheet(f"color:#536071; min-width: 32px;")
+            line_label.setStyleSheet(f"color:{TEXT_FAINT}; min-width: 30px; font-family:'{MONO_FAMILY}'; font-size:11px;")
             row_layout.addWidget(line_label)
             for index, event in lines.get(line_number, []):
-                btn = QPushButton(event["source"])
-                btn.setProperty("note", True)
-                btn.clicked.connect(lambda _checked, idx=index: self.select_note(idx))
-                btn.setMinimumHeight(32)
-                btn.setStyleSheet(self._note_style(index == self.selected_event, event["type"] == "rest"))
-                row_layout.addWidget(btn)
-                self.note_buttons[index] = btn
+                pill = NotePill(event["source"], event["type"] == "rest")
+                pill.clicked.connect(lambda _checked, idx=index: self.select_note(idx))
+                row_layout.addWidget(pill)
+                self.note_buttons[index] = pill
+            row_layout.addStretch()
             self.sheet_notes_layout.addWidget(row)
 
         self.update_note_styles()
 
-    def _note_style(self, selected, is_rest):
-        if selected:
-            return "QPushButton { background:#247f4c; color:#ffffff; border:1px solid #55d988; border-radius:6px; padding:5px 7px; font-family:'Cascadia Mono'; font-weight:700; }"
-        if is_rest:
-            return "QPushButton { background:#181c22; color:#454b53; border:1px solid #292f37; border-radius:6px; padding:5px 7px; font-family:'Cascadia Mono'; font-weight:700; }"
-        return "QPushButton { background:#181c22; color:#dfe7ef; border:1px solid #292f37; border-radius:6px; padding:5px 7px; font-family:'Cascadia Mono'; font-weight:700; }"
-
     def update_note_styles(self):
-        for idx, btn in self.note_buttons.items():
+        for idx, pill in self.note_buttons.items():
             if idx < self.selected_event:
-                btn.setStyleSheet("QPushButton { background:#15181d; color:#464c54; border:1px solid #20252b; border-radius:6px; padding:5px 7px; font-family:'Cascadia Mono'; font-weight:700; }")
+                pill.set_state("played")
             elif idx == self.selected_event:
-                btn.setStyleSheet("QPushButton { background:#247f4c; color:#ffffff; border:1px solid #55d988; border-radius:6px; padding:5px 7px; font-family:'Cascadia Mono'; font-weight:700; }")
+                pill.set_state("current")
             else:
-                btn.setStyleSheet("QPushButton { background:#181c22; color:#ffffff; border:1px solid #292f37; border-radius:6px; padding:5px 7px; font-family:'Cascadia Mono'; font-weight:700; }")
+                pill.set_state("upcoming")
         self.position = f"{self.selected_event + 1} / {len(self.events)}"
         self.position_label.setText(self.position)
 
@@ -1249,14 +1710,17 @@ class App(QMainWindow):
         self.scroll_to_note(index)
 
     def playback_finished(self, was_stopped):
+        self.transport_buttons["pause"].setEnabled(False)
+        self.status_dot.set_color(ACCENT)
+        self.status_dot_small.set_color(ACCENT)
         self.set_status("finished" if not was_stopped else "stopped")
 
-    def set_status(self, message):
+    def set_status(self, message, is_error=False):
         self.status = message
         self.status_label.setText(message)
-
-    def player_error(self, message):
-        self.set_status(message)
+        color = DANGER if is_error else ACCENT
+        self.status_dot.set_color(color)
+        self.status_dot_small.set_color(color)
 
     def start(self):
         if self.editing:
@@ -1273,10 +1737,10 @@ class App(QMainWindow):
         start_index, end_index, repeat_count = playback_options
         if self.target_mode == "specific":
             if self.active_target is None:
-                self.set_status("pick a window first")
+                self.set_status("pick a window first", is_error=True)
                 return
             if not self.active_target.is_alive():
-                self.set_status("target window closed - pick again")
+                self.set_status("target window closed - pick again", is_error=True)
                 self.refresh_windows()
                 return
             success, reason = self.active_target.focus()
@@ -1288,10 +1752,12 @@ class App(QMainWindow):
             target = None
         self.player.start(self.events, start_index, end_index, repeat_count, self.tempo, target)
         self.playback_start_index = start_index
+        self.transport_buttons["pause"].setEnabled(True)
         self.set_status(f"playing notes {start_index + 1}–{end_index + 1}")
 
     def stop(self):
         self.player.stop()
+        self.transport_buttons["pause"].setEnabled(False)
         if not self.editing:
             self.selected_event = self.playback_start_index
             self.update_note_styles()
@@ -1310,10 +1776,10 @@ class App(QMainWindow):
         try:
             repeat_count = int(self.loop_repeats)
         except ValueError:
-            self.set_status("enter a whole number of plays")
+            self.set_status("enter a whole number of plays", is_error=True)
             return None
         if repeat_count < 0:
-            self.set_status("plays cannot be negative")
+            self.set_status("plays cannot be negative", is_error=True)
             return None
         if self.loop_scope == "whole sheet":
             return 0, len(self.events) - 1, repeat_count
@@ -1321,10 +1787,10 @@ class App(QMainWindow):
             range_start = int(self.loop_start) - 1
             range_end = int(self.loop_end) - 1
         except ValueError:
-            self.set_status("enter whole-number range limits")
+            self.set_status("enter whole-number range limits", is_error=True)
             return None
         if not 0 <= range_start <= range_end < len(self.events):
-            self.set_status(f"range must be between 1 and {len(self.events)}")
+            self.set_status(f"range must be between 1 and {len(self.events)}", is_error=True)
             return None
         return range_start, range_end, repeat_count
 
@@ -1362,7 +1828,7 @@ class App(QMainWindow):
             keyboard.add_hotkey(EXIT_HOTKEY, self.exit_program)
         except Exception as error:
             log.exception("hotkey registration failed - try running as admin")
-            self.set_status(f"hotkey error: {error}")
+            self.set_status(f"hotkey error: {error}", is_error=True)
 
     def exit_program(self):
         self.save_current_sheet()
@@ -1376,6 +1842,9 @@ class App(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    font = QFont(FONT_FAMILY, 10)
+    app.setFont(font)
     window = App()
     window.show()
     sys.exit(app.exec())
