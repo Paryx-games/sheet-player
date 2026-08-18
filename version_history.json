@@ -23,7 +23,7 @@
             "version": "1.3.0",
             "download_url": "https://github.com/Paryx-games/sheet-player/releases/download/v1.3.0/PianoPlayer.exe",
             "changelog": "PySide6 migration and premium UI refresh: more polished dark interface, improved sheet editor, and smoother playback controls while preserving the core piano automation workflow.",
-            "mandatory": true
+            "mandatory": false
         },
         {
         "version": "1.4.0",
