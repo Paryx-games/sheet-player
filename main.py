@@ -247,6 +247,7 @@ class SheetLibrary:
         self.sheets = {self.DEFAULT_SHEET_NAME: ""}
         self.active_sheet_name = self.DEFAULT_SHEET_NAME
         self.settings = {}
+        self.sheet_settings = {}
         self.load()
 
     def load(self):
@@ -280,6 +281,13 @@ class SheetLibrary:
         if isinstance(settings, dict):
             self.settings = settings
 
+        sheet_settings = content.get("sheet_settings", {})
+        if isinstance(sheet_settings, dict):
+            self.sheet_settings = {
+                name: value for name, value in sheet_settings.items()
+                if isinstance(name, str) and isinstance(value, dict)
+            }
+
     def save(self):
         try:
             os.makedirs(self.storage_directory, exist_ok=True)
@@ -289,6 +297,7 @@ class SheetLibrary:
                     {
                         "active_sheet_name": self.active_sheet_name,
                         "settings": self.settings,
+                        "sheet_settings": self.sheet_settings,
                         "sheets": self.sheets,
                     },
                     handle,
@@ -352,6 +361,21 @@ class SheetLibrary:
 
     def get_setting(self, name, default):
         return self.settings.get(name, default)
+
+    def get_sheet_setting(self, sheet_name, name, default):
+        settings = self.sheet_settings.get(sheet_name, {})
+        if not isinstance(settings, dict):
+            return default
+        return settings.get(name, default)
+
+    def set_sheet_settings(self, sheet_name, settings):
+        if sheet_name not in self.sheets:
+            return False
+        if not isinstance(settings, dict):
+            return False
+        self.sheet_settings.setdefault(sheet_name, {})
+        self.sheet_settings[sheet_name].update(settings)
+        return True
 
     def set_settings(self, settings):
         self.settings = settings
@@ -1104,12 +1128,12 @@ class App(QMainWindow):
         self.is_loading_sheet = False
         self.sidebar_visible = self.sheet_library.get_setting("sidebar_visible", True)
         self.overlay_active = False
-        self.tempo = self.sheet_library.get_setting("tempo", DEFAULT_TEMPO)
-        self.loop_enabled = self.sheet_library.get_setting("loop_enabled", False)
-        self.loop_scope = self.sheet_library.get_setting("loop_scope", "whole sheet")
-        self.loop_start = str(self.sheet_library.get_setting("loop_start", 1))
-        self.loop_end = str(self.sheet_library.get_setting("loop_end", 1))
-        self.loop_repeats = str(self.sheet_library.get_setting("loop_repeats", 1))
+        self.tempo = self.sheet_library.get_sheet_setting(self.sheet_library.get_active_sheet_name(), "tempo", DEFAULT_TEMPO)
+        self.loop_enabled = self.sheet_library.get_sheet_setting(self.sheet_library.get_active_sheet_name(), "loop_enabled", False)
+        self.loop_scope = self.sheet_library.get_sheet_setting(self.sheet_library.get_active_sheet_name(), "loop_scope", "whole sheet")
+        self.loop_start = str(self.sheet_library.get_sheet_setting(self.sheet_library.get_active_sheet_name(), "loop_start", 1))
+        self.loop_end = str(self.sheet_library.get_sheet_setting(self.sheet_library.get_active_sheet_name(), "loop_end", 1))
+        self.loop_repeats = str(self.sheet_library.get_sheet_setting(self.sheet_library.get_active_sheet_name(), "loop_repeats", 1))
         self.status = "paste a sheet"
         self.position = "0 / 0"
         self.target_mode = self.sheet_library.get_setting("target_mode", "foreground")
@@ -1590,8 +1614,10 @@ class App(QMainWindow):
         sheet_name = item.text()
         if sheet_name == self.sheet_library.get_active_sheet_name():
             return
+        self.save_active_sheet_settings()
         self.save_current_sheet()
         self.sheet_library.set_active_sheet_name(sheet_name)
+        self.apply_sheet_settings(sheet_name)
         self.show_active_sheet_in_editor()
         self.save_library()
 
@@ -1610,16 +1636,50 @@ class App(QMainWindow):
         self.sheet_library.set_sheet_content(self.sheet_library.get_active_sheet_name(), sheet_content)
         self.save_library()
 
-    def save_library(self):
-        self.sheet_library.set_settings({
+    def save_active_sheet_settings(self):
+        sheet_name = self.sheet_library.get_active_sheet_name()
+        self.sheet_library.set_sheet_settings(sheet_name, {
             "loop_enabled": self.loop_enabled,
             "loop_end": self.loop_end,
             "loop_repeats": self.loop_repeats,
             "loop_scope": self.loop_scope,
             "loop_start": self.loop_start,
+            "tempo": self.tempo,
+        })
+
+    def apply_sheet_settings(self, sheet_name):
+        self.tempo = self.sheet_library.get_sheet_setting(sheet_name, "tempo", DEFAULT_TEMPO)
+        self.loop_enabled = self.sheet_library.get_sheet_setting(sheet_name, "loop_enabled", False)
+        self.loop_scope = self.sheet_library.get_sheet_setting(sheet_name, "loop_scope", "whole sheet")
+        self.loop_start = str(self.sheet_library.get_sheet_setting(sheet_name, "loop_start", 1))
+        self.loop_end = str(self.sheet_library.get_sheet_setting(sheet_name, "loop_end", 1))
+        self.loop_repeats = str(self.sheet_library.get_sheet_setting(sheet_name, "loop_repeats", 1))
+        if hasattr(self, "tempo_slider"):
+            self.tempo_slider.blockSignals(True)
+            self.tempo_slider.setValue(self.tempo)
+            self.tempo_slider.blockSignals(False)
+        if hasattr(self, "tempo_value_label"):
+            self.tempo_value_label.setText(str(self.tempo))
+        if hasattr(self, "loop_checkbox"):
+            self.loop_checkbox.blockSignals(True)
+            self.loop_checkbox.setChecked(self.loop_enabled)
+            self.loop_checkbox.blockSignals(False)
+        if hasattr(self, "loop_scope_box"):
+            self.loop_scope_box.blockSignals(True)
+            self.loop_scope_box.setCurrentText(self.loop_scope)
+            self.loop_scope_box.blockSignals(False)
+        if hasattr(self, "loop_start_box"):
+            self.loop_start_box.setText(self.loop_start)
+        if hasattr(self, "loop_end_box"):
+            self.loop_end_box.setText(self.loop_end)
+        if hasattr(self, "loop_repeats_box"):
+            self.loop_repeats_box.setText(self.loop_repeats)
+
+    def save_library(self):
+        self.save_active_sheet_settings()
+        self.sheet_library.set_settings({
             "sidebar_visible": self.sidebar_visible,
             "target_mode": self.target_mode,
-            "tempo": self.tempo,
         })
         self.sheet_library.save()
 
@@ -1633,6 +1693,7 @@ class App(QMainWindow):
         self.events = []
         self.selected_event = 0
         self.load_active_sheet()
+        self.apply_sheet_settings(self.sheet_library.get_active_sheet_name())
         self.editing = True
         self.notes_wrap.setVisible(False)
         self.editor_wrap.setVisible(True)
