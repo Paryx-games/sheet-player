@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import keyboard
 import psutil
@@ -407,67 +408,109 @@ class SheetParser:
             return SHIFT_SYMBOLS[char]
         return None
 
-    @classmethod
-    def parse(cls, text):
+    @staticmethod
+    def _parse_line(line, line_number):
         events = []
-        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        for line_number, line in enumerate(lines):
-            i = 0
-            while i < len(line):
-                char = line[i]
-                if char == " ":
-                    events.append({"type": "rest", "length": 0.35, "source": " ", "line": line_number})
-                    i += 1
-                    continue
-                if char == "-":
-                    count = 0
-                    while i < len(line) and line[i] == "-":
-                        count += 1
-                        i += 1
-                    events.append({"type": "rest", "length": float(count), "source": "-" * count, "line": line_number})
-                    continue
-                if char == "[":
-                    end = line.find("]", i + 1)
-                    if end == -1:
-                        raise ValueError(f"missing ] on line {line_number + 1}")
-                    contents = line[i + 1:end]
-                    actions = []
-                    for item in contents:
-                        if item.isspace():
-                            continue
-                        action = cls.key_to_action(item)
-                        if action is None:
-                            raise ValueError(f"unsupported character {item!r} on line {line_number + 1}")
-                        actions.append(action)
-                    if not actions:
-                        raise ValueError(f"empty chord on line {line_number + 1}")
-                    events.append({"type": "chord", "actions": actions, "source": line[i:end + 1], "line": line_number})
-                    i = end + 1
-                    continue
-                if char == "{":
-                    end = line.find("}", i + 1)
-                    if end == -1:
-                        raise ValueError(f"missing }} on line {line_number + 1}")
-                    contents = line[i + 1:end]
-                    actions = []
-                    for item in contents:
-                        if item.isspace():
-                            continue
-                        action = cls.key_to_action(item)
-                        if action is None:
-                            raise ValueError(f"unsupported character {item!r} on line {line_number + 1}")
-                        actions.append(action)
-                    if not actions:
-                        raise ValueError(f"empty run on line {line_number + 1}")
-                    events.append({"type": "run", "actions": actions, "source": line[i:end + 1], "line": line_number})
-                    i = end + 1
-                    continue
-                action = cls.key_to_action(char)
-                if action is None:
-                    raise ValueError(f"unsupported character {char!r} on line {line_number + 1}")
-                events.append({"type": "note", "actions": [action], "source": char, "line": line_number})
+        i = 0
+        line_length = len(line)
+        while i < line_length:
+            char = line[i]
+            if char == " ":
+                events.append({"type": "rest", "length": 0.35, "source": " ", "line": line_number})
                 i += 1
+                continue
+            if char == "-":
+                count = 0
+                while i < line_length and line[i] == "-":
+                    count += 1
+                    i += 1
+                events.append({"type": "rest", "length": float(count), "source": "-" * count, "line": line_number})
+                continue
+            if char == "[":
+                end = line.find("]", i + 1)
+                if end == -1:
+                    raise ValueError(f"missing ] on line {line_number + 1}")
+                contents = line[i + 1:end]
+                actions = []
+                for item in contents:
+                    if item.isspace():
+                        continue
+                    action = SheetParser.key_to_action(item)
+                    if action is None:
+                        raise ValueError(f"unsupported character {item!r} on line {line_number + 1}")
+                    actions.append(action)
+                if not actions:
+                    raise ValueError(f"empty chord on line {line_number + 1}")
+                events.append({"type": "chord", "actions": actions, "source": line[i:end + 1], "line": line_number})
+                i = end + 1
+                continue
+            if char == "{":
+                end = line.find("}", i + 1)
+                if end == -1:
+                    raise ValueError(f"missing }} on line {line_number + 1}")
+                contents = line[i + 1:end]
+                actions = []
+                for item in contents:
+                    if item.isspace():
+                        continue
+                    action = SheetParser.key_to_action(item)
+                    if action is None:
+                        raise ValueError(f"unsupported character {item!r} on line {line_number + 1}")
+                    actions.append(action)
+                if not actions:
+                    raise ValueError(f"empty run on line {line_number + 1}")
+                events.append({"type": "run", "actions": actions, "source": line[i:end + 1], "line": line_number})
+                i = end + 1
+                continue
+            action = SheetParser.key_to_action(char)
+            if action is None:
+                raise ValueError(f"unsupported character {char!r} on line {line_number + 1}")
+            events.append({"type": "note", "actions": [action], "source": char, "line": line_number})
+            i += 1
         return events
+
+    @classmethod
+    def parse(cls, text, max_workers=None):
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if not lines:
+            return []
+
+        if max_workers is None:
+            max_workers = min(8, max(1, os.cpu_count() or 1))
+
+        # Small texts do not benefit from thread startup overhead.
+        if len(lines) <= 2 or max_workers <= 1:
+            events = []
+            for line_number, line in enumerate(lines):
+                events.extend(cls._parse_line(line, line_number))
+            return events
+
+        chunk_size = max(1, len(lines) // max_workers)
+        tasks = []
+        for start in range(0, len(lines), chunk_size):
+            end = min(start + chunk_size, len(lines))
+            tasks.append((start, lines[start:end]))
+
+        events_by_line = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for line_index, chunk_lines in tasks:
+                futures.append(executor.submit(cls._parse_lines_chunk, line_index, chunk_lines))
+            for future in futures:
+                events_by_line.extend(future.result())
+
+        merged = []
+        for _, line_events in sorted(events_by_line, key=lambda item: item[0]):
+            merged.extend(line_events)
+        return merged
+
+    @staticmethod
+    def _parse_lines_chunk(start_index, lines):
+        processed = []
+        for offset, line in enumerate(lines):
+            line_number = start_index + offset
+            processed.append((line_number, SheetParser._parse_line(line, line_number)))
+        return processed
 
 
 class Player:
@@ -973,6 +1016,8 @@ class App(QMainWindow):
         self.player = Player(self.note_changed, self.player_error, self.playback_finished)
         self._sidebar_anim = None
         self._sidebar_width = 260
+        self._last_status_key = None
+        self._last_note_states = {}
         self._build_ui()
         self.load_active_sheet()
         self.refresh_sheet_list()
@@ -1683,13 +1728,25 @@ class App(QMainWindow):
         self.update_note_styles()
 
     def update_note_styles(self):
+        if not self.note_buttons:
+            return
+
+        next_states = {}
         for idx, pill in self.note_buttons.items():
             if idx < self.selected_event:
-                pill.set_state("played")
+                next_states[idx] = "played"
             elif idx == self.selected_event:
-                pill.set_state("current")
+                next_states[idx] = "current"
             else:
-                pill.set_state("upcoming")
+                next_states[idx] = "upcoming"
+
+        for idx, pill in self.note_buttons.items():
+            state = next_states[idx]
+            previous_state = self._last_note_states.get(idx)
+            if previous_state != state:
+                pill.set_state(state)
+                self._last_note_states[idx] = state
+
         self.position = f"{self.selected_event + 1} / {len(self.events)}"
         self.position_label.setText(self.position)
 
@@ -1718,6 +1775,10 @@ class App(QMainWindow):
         self.set_status("finished" if not was_stopped else "stopped")
 
     def set_status(self, message, is_error=False):
+        status_key = (message, is_error)
+        if status_key == self._last_status_key:
+            return
+        self._last_status_key = status_key
         self.status = message
         self.status_label.setText(message)
         color = DANGER if is_error else ACCENT
