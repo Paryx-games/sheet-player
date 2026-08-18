@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (
 import paths
 import updater
 
-CURRENT_VERSION = "1.4.0"
+CURRENT_VERSION = "1.5.0"
 LOG_PATH = paths.LOG_PATH
 SHEET_LIBRARY_FILE_NAME = paths.SHEET_LIBRARY_FILE_NAME
 SHEET_FILE_EXTENSION = ".piano-sheet.json"

@@ -26,10 +26,16 @@
             "mandatory": false
         },
         {
-        "version": "1.4.0",
-        "download_url": "https://github.com/Paryx-games/sheet-player/releases/download/v1.4.0/PianoPlayerSetup.exe",
-        "changelog": "Installer-based auto-update: the app now downloads the new installer, silently removes the old install, and launches the upgraded version cleanly. Also overhauled the UI a bunch.",
-        "mandatory": true
+            "version": "1.4.0",
+            "download_url": "https://github.com/Paryx-games/sheet-player/releases/download/v1.4.0/PianoPlayerSetup.exe",
+            "changelog": "Installer-based auto-update: the app now downloads the new installer, silently removes the old install, and launches the upgraded version cleanly. Also overhauled the UI a bunch.",
+            "mandatory": true
+        },
+        {
+            "version": "1.5.0",
+            "download_url": "https://github.com/Paryx-games/sheet-player/releases/download/v1.5.0/PianoPlayerSetup.exe",
+            "changelog": "Added midi support, per sheet tempo and per sheet settings, performance optimisations (multi threading).",
+            "mandatory": false
         }
     ]
 }
