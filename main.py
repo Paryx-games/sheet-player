@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QScrollArea,
     QSlider,
     QVBoxLayout,
@@ -976,6 +977,7 @@ class App(QMainWindow):
         self.load_active_sheet()
         self.refresh_sheet_list()
         self._register_hotkeys()
+        QTimer.singleShot(600, self.check_for_updates)
         if not is_admin():
             QTimer.singleShot(200, self.show_admin_overlay)
 
@@ -1801,6 +1803,92 @@ class App(QMainWindow):
         except FileNotFoundError:
             content = "no log written yet - hit start first"
         QMessageBox.information(self, "debug log", content)
+
+    def check_for_updates(self):
+        try:
+            update = updater.check_for_update(CURRENT_VERSION)
+        except Exception:
+            log.exception("update check crashed")
+            return
+
+        if update is None:
+            return
+
+        skipped_version = None
+        try:
+            with open(paths.SKIPPED_VERSION_PATH, "r", encoding="utf-8") as handle:
+                skipped_version = handle.read().strip()
+        except FileNotFoundError:
+            skipped_version = None
+        except OSError:
+            log.exception("failed to read skipped version file")
+            skipped_version = None
+
+        if skipped_version == update.version and not update.mandatory:
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("update available")
+        dialog.setText(f"Version {update.version} is available.")
+        message = "This will download the new installer, uninstall the old version, and relaunch the app."
+        if update.changelog:
+            message = f"{message}\n\n{update.changelog}"
+        dialog.setInformativeText(message)
+        dialog.setIcon(QMessageBox.Information)
+
+        if update.mandatory:
+            dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        else:
+            dialog.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            dialog.button(QMessageBox.StandardButton.Yes).setText("update now")
+            dialog.button(QMessageBox.StandardButton.No).setText("remind later")
+
+        result = dialog.exec()
+
+        if update.mandatory:
+            accepted = result == QMessageBox.StandardButton.Ok
+        else:
+            accepted = result == QMessageBox.StandardButton.Yes
+
+        if not accepted:
+            if not update.mandatory:
+                try:
+                    with open(paths.SKIPPED_VERSION_PATH, "w", encoding="utf-8") as handle:
+                        handle.write(update.version)
+                except OSError:
+                    log.exception("failed to persist skipped version")
+            return
+
+        self.set_status("downloading update…")
+        try:
+            self._download_and_apply_update(update)
+        except Exception:
+            log.exception("update install failed")
+            self.set_status("update failed - see log", is_error=True)
+            QMessageBox.critical(
+                self,
+                "update failed",
+                "The new installer could not be downloaded or launched. Please retry later.",
+            )
+
+    def _download_and_apply_update(self, update):
+        dialog = QProgressDialog("Downloading installer…", "Cancel", 0, 0, self)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.show()
+
+        def progress(bytes_read, total):
+            if total > 0:
+                dialog.setValue(int(bytes_read / total * 100))
+            QApplication.processEvents()
+
+        temp_installer = updater.download_update(update.download_url, progress_callback=progress)
+        dialog.close()
+
+        if not updater.apply_update_and_relaunch(temp_installer):
+            raise RuntimeError("installer update launcher failed")
+
+        self.exit_program()
 
     def show_admin_overlay(self):
         msg = QMessageBox(self)

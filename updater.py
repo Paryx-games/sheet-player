@@ -47,6 +47,80 @@ def parse_version(text):
     return tuple(parts)
 
 
+def find_installer_uninstall_exe(current_exe_path):
+    """Return the Inno Setup uninstaller if it exists next to the app."""
+    install_dir = os.path.dirname(os.path.abspath(current_exe_path))
+    candidates = [
+        os.path.join(install_dir, "unins000.exe"),
+        os.path.join(install_dir, "unins001.exe"),
+        os.path.join(install_dir, "unins.exe"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def create_installer_update_batch(current_exe_path, new_installer_path, uninstaller_path=None):
+    """Create a batch file that silently uninstalls the old version and then
+    runs the new Inno Setup installer. This is required because the app is
+    installed to Program Files and the running executable cannot be replaced in
+    place while in use."""
+    current_exe_path = os.path.abspath(current_exe_path)
+    new_installer_path = os.path.abspath(new_installer_path)
+    uninstaller_path = os.path.abspath(uninstaller_path) if uninstaller_path else None
+
+    pid = os.getpid()
+
+    uninstall_block = ""
+    if uninstaller_path:
+        uninstall_block = f'''if exist "{uninstaller_path}" (
+    echo uninstalling previous version
+    start /wait "" "{uninstaller_path}" /VERYSILENT /NORESTART /SUPPRESSMSGBOXES
+    if errorlevel 1 (
+        echo previous version uninstall returned code %errorlevel%
+    )
+)
+'''
+
+    batch_contents = f'''@echo off
+setlocal
+
+:wait_loop
+tasklist /fi "PID eq {pid}" 2>NUL | find "{pid}" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >NUL
+    goto wait_loop
+)
+
+if not exist "{new_installer_path}" (
+    echo update installer does not exist
+    exit /b 1
+)
+
+{uninstall_block}if not exist "{new_installer_path}" (
+    echo update installer missing before install
+    exit /b 1
+)
+
+start /wait "" "{new_installer_path}" /VERYSILENT /NORESTART /SUPPRESSMSGBOXES
+if errorlevel 1 (
+    echo installer exited with code %errorlevel%
+    exit /b 1
+)
+
+start "" "{current_exe_path}"
+if errorlevel 1 (
+    echo failed to relaunch updated app
+    exit /b 1
+)
+
+del "%~f0"
+'''
+
+    return batch_contents
+
+
 def check_for_update(current_version):
     """
     fetches version.json and returns update_info when a newer version
@@ -95,7 +169,7 @@ def check_for_update(current_version):
 
 def download_update(download_url, progress_callback=None):
     """
-    downloads the new exe to a temporary file and returns its path.
+    downloads the new installer to a temporary file and returns its path.
     """
     request = urllib.request.Request(
         download_url,
@@ -142,10 +216,10 @@ def download_update(download_url, progress_callback=None):
 
 
 def apply_update_and_relaunch(new_exe_path):
-    """
-    launches a temporary batch updater which waits for the current
-    process to exit, replaces the executable, then starts the new one.
-    """
+    """Wait for the running app to exit, silently uninstall the previous
+    installer version if needed, then run the downloaded installer and relaunch
+    the app. The new installer is the real upgrade mechanism when the app is
+    installed via Inno Setup."""
     if not getattr(sys, "frozen", False):
         log.warning(
             "apply_update_and_relaunch called while running as a "
@@ -160,50 +234,23 @@ def apply_update_and_relaunch(new_exe_path):
         log.error("update file does not exist: %s", new_exe_path)
         return False
 
-    log.info("current exe: %s", current_exe)
-    log.info("new exe: %s", new_exe_path)
+    uninstaller_path = find_installer_uninstall_exe(current_exe)
+    batch_contents = create_installer_update_batch(
+        current_exe,
+        new_exe_path,
+        uninstaller_path,
+    )
 
     batch_path = str(paths.TEMP_UPDATE_BATCH_PATH)
-
-    pid = os.getpid()
-
-    batch_contents = f"""@echo off
-setlocal
-
-:wait_loop
-tasklist /fi "PID eq {pid}" 2>NUL | find "{pid}" >NUL
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >NUL
-    goto wait_loop
-)
-
-if not exist "{new_exe_path}" (
-    echo update file does not exist
-    exit /b 1
-)
-
-move /y "{new_exe_path}" "{current_exe}"
-
-if errorlevel 1 (
-    echo failed to replace executable
-    exit /b 1
-)
-
-start "" "{current_exe}"
-
-if errorlevel 1 (
-    echo failed to launch updated executable
-    exit /b 1
-)
-
-del "%~f0"
-"""
 
     try:
         with open(batch_path, "w", encoding="utf-8") as handle:
             handle.write(batch_contents)
 
-        log.info("launching update script: %s", batch_path)
+        log.info("current exe: %s", current_exe)
+        log.info("new installer: %s", new_exe_path)
+        log.info("uninstaller: %s", uninstaller_path)
+        log.info("launching installer update script: %s", batch_path)
 
         subprocess.Popen(
             ["cmd.exe", "/c", batch_path],
@@ -214,5 +261,5 @@ del "%~f0"
         return True
 
     except Exception:
-        log.exception("failed to launch update script")
+        log.exception("failed to launch installer update script")
         return False
