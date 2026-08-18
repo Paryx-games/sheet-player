@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import keyboard
+import mido
 import psutil
 import pydirectinput
 import win32con
@@ -441,7 +442,7 @@ class SheetParser:
                     actions.append(action)
                 if not actions:
                     raise ValueError(f"empty chord on line {line_number + 1}")
-                events.append({"type": "chord", "actions": actions, "source": line[i:end + 1], "line": line_number})
+                events.append({"type": "chord", "actions": actions, "source": line[i:end + 1], "line": line_number, "beats": 1.0})
                 i = end + 1
                 continue
             if char == "{":
@@ -459,13 +460,13 @@ class SheetParser:
                     actions.append(action)
                 if not actions:
                     raise ValueError(f"empty run on line {line_number + 1}")
-                events.append({"type": "run", "actions": actions, "source": line[i:end + 1], "line": line_number})
+                events.append({"type": "run", "actions": actions, "source": line[i:end + 1], "line": line_number, "beats": 1.0})
                 i = end + 1
                 continue
             action = SheetParser.key_to_action(char)
             if action is None:
                 raise ValueError(f"unsupported character {char!r} on line {line_number + 1}")
-            events.append({"type": "note", "actions": [action], "source": char, "line": line_number})
+            events.append({"type": "note", "actions": [action], "source": char, "line": line_number, "beats": 1.0})
             i += 1
         return events
 
@@ -511,6 +512,67 @@ class SheetParser:
             line_number = start_index + offset
             processed.append((line_number, SheetParser._parse_line(line, line_number)))
         return processed
+
+
+def midi_note_to_sheet_char(note_number):
+    mapping = "awsedftgyhujk"
+    return mapping[note_number % len(mapping)]
+
+
+def apply_timing_scale(event, scale_factor):
+    if not isinstance(scale_factor, (int, float)) or scale_factor <= 0:
+        raise ValueError("timing scale must be a positive number")
+    scale_factor = float(scale_factor)
+    if event["type"] == "rest":
+        event["length"] = max(0.25, float(event.get("length", 0.5)) * scale_factor)
+        return event
+    if event["type"] in {"note", "chord", "run"}:
+        event["beats"] = max(0.25, float(event.get("beats", 1.0)) * scale_factor)
+        return event
+    return event
+
+
+def midi_to_sheet_text(midi_path):
+    midi_file = mido.MidiFile(midi_path)
+    note_starts = {}
+    note_events = []
+    current_time = 0
+
+    for track in midi_file.tracks:
+        current_time = 0
+        for message in track:
+            current_time += message.time
+            if message.type == "note_on" and message.velocity > 0:
+                note_starts.setdefault(message.note, current_time)
+            elif message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
+                if message.note in note_starts:
+                    start_time = note_starts.pop(message.note)
+                    duration = max(1, int(round((current_time - start_time) / max(1, midi_file.ticks_per_beat))))
+                    note_events.append((start_time, duration, message.note))
+
+    if not note_events:
+        return ""
+
+    note_events.sort(key=lambda item: item[0])
+    output_lines = []
+    previous_end = 0
+    for _, duration, note_number in note_events:
+        gap = max(0, int(round((note_events[0][0] if False else 0))))
+        note_char = midi_note_to_sheet_char(note_number)
+        if output_lines and len(output_lines[-1]) < 24:
+            output_lines[-1] += note_char
+        else:
+            output_lines.append(note_char)
+        for _ in range(max(0, duration - 1)):
+            if len(output_lines[-1]) < 24:
+                output_lines[-1] += " "
+            else:
+                output_lines.append(" ")
+
+    sheet = "\n".join(output_lines)
+    if not sheet:
+        return "a"
+    return sheet
 
 
 class Player:
@@ -648,8 +710,8 @@ class Player:
     @staticmethod
     def _event_beats(event):
         if event["type"] == "rest":
-            return event["length"] if event["source"] != " " else 0.5
-        return 1.0
+            return float(event.get("length", 0.5)) if event.get("source") != " " else 0.5
+        return float(event.get("beats", 1.0))
 
     def _run(self, start_index, end_index, repeat_count, tempo):
         beat_seconds = 60.0 / tempo
@@ -993,6 +1055,9 @@ class App(QMainWindow):
         self.events = []
         self.note_buttons = {}
         self.selected_event = 0
+        self.selected_events = set()
+        self.drag_selecting = False
+        self.drag_start_index = None
         self.playback_start_index = 0
         self.editing = True
         self.closing = False
@@ -1289,6 +1354,16 @@ class App(QMainWindow):
         self.tempo_slider.setStyleSheet(self._slider_style())
         layout.addWidget(self.tempo_slider)
 
+        self.timing_down_button = AnimatedButton("-10%")
+        self.timing_down_button.setFixedWidth(82)
+        self.timing_down_button.clicked.connect(lambda: self.apply_selection_timing(0.9))
+        layout.addWidget(self.timing_down_button)
+
+        self.timing_up_button = AnimatedButton("+10%")
+        self.timing_up_button.setFixedWidth(82)
+        self.timing_up_button.clicked.connect(lambda: self.apply_selection_timing(1.1))
+        layout.addWidget(self.timing_up_button)
+
         return self.controls
 
     def _build_status_bar(self):
@@ -1440,6 +1515,20 @@ class App(QMainWindow):
         self.tempo = value
         self.tempo_value_label.setText(str(value))
         self.save_library()
+
+    def apply_selection_timing(self, scale_factor):
+        if self.editing:
+            selection = self.selected_events or {self.selected_event}
+            if not self.events:
+                self.set_status("there is no sheet to edit", is_error=True)
+                return
+            for idx in sorted(selection):
+                if 0 <= idx < len(self.events):
+                    apply_timing_scale(self.events[idx], scale_factor)
+            self.render_notes()
+            self.set_status(f"timing x{scale_factor:.2f} on {len(selection)} event(s)")
+            return
+        self.set_status("submit the sheet to edit timing", is_error=True)
 
     def set_loop_enabled(self, enabled):
         self.loop_enabled = enabled
@@ -1593,9 +1682,20 @@ class App(QMainWindow):
         self.show_validation_preview(sheet_content, "Validation preview")
 
     def import_sheet(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Import sheet", "", "Piano sheet (*.piano-sheet.json *.txt)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Import sheet", "", "Piano sheet (*.piano-sheet.json *.txt *.mid *.midi)")
         if not file_path:
             return
+
+        if file_path.lower().endswith((".mid", ".midi")):
+            try:
+                sheet_text = midi_to_sheet_text(file_path)
+            except Exception as error:
+                QMessageBox.critical(self, "Cannot import MIDI", f"could not read MIDI file: {error}")
+                return
+            imported_sheet = {"name": os.path.splitext(os.path.basename(file_path))[0], "sheet": sheet_text}
+            self.show_validation_preview(imported_sheet["sheet"], "Import preview", "Import sheet", lambda _events: self.finish_import(imported_sheet))
+            return
+
         imported_sheet, error = SheetFileCodec.load(file_path)
         if error is not None:
             QMessageBox.critical(self, "Cannot import sheet", error)
@@ -1693,6 +1793,8 @@ class App(QMainWindow):
         if self.player.playing:
             return
         self.editing = True
+        self.drag_selecting = False
+        self.drag_start_index = None
         self.notes_wrap.setVisible(False)
         self.editor_wrap.setVisible(True)
         self.set_status("editing")
@@ -1703,6 +1805,7 @@ class App(QMainWindow):
             if child.widget():
                 child.widget().deleteLater()
         self.note_buttons = {}
+        self.selected_events = set()
 
         lines = {}
         for index, event in enumerate(self.events):
@@ -1720,11 +1823,31 @@ class App(QMainWindow):
             for index, event in lines.get(line_number, []):
                 pill = NotePill(event["source"], event["type"] == "rest")
                 pill.clicked.connect(lambda _checked, idx=index: self.select_note(idx))
+                pill.pressed.connect(lambda _checked, idx=index: self.begin_drag_selection(idx))
+                pill.mouseMoveEvent = lambda event, idx=index: self.drag_select_note(event, idx)
                 row_layout.addWidget(pill)
                 self.note_buttons[index] = pill
             row_layout.addStretch()
             self.sheet_notes_layout.addWidget(row)
 
+        self.update_note_styles()
+
+    def begin_drag_selection(self, index):
+        if self.editing:
+            self.drag_selecting = True
+            self.drag_start_index = index
+            self.selected_events = {index}
+            self.selected_event = index
+            self.update_note_styles()
+
+    def drag_select_note(self, event, index):
+        if not self.drag_selecting or not self.editing:
+            return
+        if index == self.drag_start_index:
+            return
+        start, end = sorted((self.drag_start_index, index))
+        self.selected_events = set(range(start, end + 1))
+        self.selected_event = index
         self.update_note_styles()
 
     def update_note_styles(self):
@@ -1733,7 +1856,9 @@ class App(QMainWindow):
 
         next_states = {}
         for idx, pill in self.note_buttons.items():
-            if idx < self.selected_event:
+            if self.editing and self.selected_events and idx in self.selected_events:
+                next_states[idx] = "current"
+            elif idx < self.selected_event:
                 next_states[idx] = "played"
             elif idx == self.selected_event:
                 next_states[idx] = "current"
@@ -1752,6 +1877,13 @@ class App(QMainWindow):
 
     def select_note(self, index):
         if self.editing:
+            if self.drag_selecting:
+                return
+            self.selected_event = index
+            self.selected_events = {index}
+            self.update_note_styles()
+            self.scroll_to_note(index)
+            self.set_status(f"selected note {index + 1}")
             return
         self.player.stop()
         self.selected_event = index
